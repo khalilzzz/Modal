@@ -4,6 +4,6 @@ defaults:
   - override /model: two_stream_transformer
 
 training:
-  epochs: 40
-  batch_size: 16
+  epochs: 10
+  batch_size: 64
   lr: 0.0003
