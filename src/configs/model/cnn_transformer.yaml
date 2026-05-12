@@ -1,0 +1,10 @@
+# @package _global_
+# ResNet18 per frame + Transformer encoder over time (Track A: pretrained=false)
+model:
+  name: cnn_transformer
+  pretrained: false
+  num_classes: ${num_classes}
+  num_heads: 8
+  num_layers: 2
+  dim_feedforward: 1024
+  dropout: 0.1

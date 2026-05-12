@@ -1,0 +1,9 @@
+# @package _global_
+# CNN + Temporal Transformer — Track A (from scratch, no pretrained weights)
+defaults:
+  - override /model: cnn_transformer
+
+training:
+  epochs: 30
+  batch_size: 16
+  lr: 0.0001

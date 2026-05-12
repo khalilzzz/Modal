@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
+from models.cnn_transformer import CNNTransformer
 from utils import build_transforms, set_seed, split_train_val
 
 
@@ -44,6 +45,15 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_classes=num_classes,
             pretrained=pretrained,
             lstm_hidden_size=int(hidden),
+        )
+    if name == "cnn_transformer":
+        return CNNTransformer(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            num_heads=int(cfg.model.get("num_heads", 8)),
+            num_layers=int(cfg.model.get("num_layers", 2)),
+            dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
+            dropout=float(cfg.model.get("dropout", 0.1)),
         )
 
     raise ValueError(f"Unknown model.name: {name}")
