@@ -7,3 +7,4 @@ training:
   # Where to save the best checkpoint (by validation accuracy)
   checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
   device: cuda
+  resume_checkpoint: null

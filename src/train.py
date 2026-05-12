@@ -28,6 +28,7 @@ from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.cnn_transformer import CNNTransformer
+from models.two_stream_transformer import TwoStreamTransformer
 from utils import build_transforms, set_seed, split_train_val
 
 
@@ -54,6 +55,18 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_layers=int(cfg.model.get("num_layers", 2)),
             dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
             dropout=float(cfg.model.get("dropout", 0.1)),
+        )
+    if name == "two_stream_transformer":
+        return TwoStreamTransformer(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            base_channels=int(cfg.model.get("base_channels", 32)),
+            spatial_attn_heads=int(cfg.model.get("spatial_attn_heads", 4)),
+            d_model=int(cfg.model.get("d_model", 256)),
+            num_heads=int(cfg.model.get("num_heads", 8)),
+            num_layers=int(cfg.model.get("num_layers", 4)),
+            dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
+            dropout=float(cfg.model.get("dropout", 0.2)),
         )
 
     raise ValueError(f"Unknown model.name: {name}")
@@ -186,10 +199,19 @@ def main(cfg: DictConfig) -> None:
     )
 
     model = build_model(cfg).to(device)
-    loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.training.lr))
 
     best_val_accuracy = 0.0
+    resume_path = cfg.training.get("resume_checkpoint")
+    if resume_path:
+        resume_path = Path(resume_path).resolve()
+        print(f"Resuming weights from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        best_val_accuracy = float(ckpt.get("val_accuracy", 0.0))
+        print(f"Resuming best val accuracy from checkpoint: {best_val_accuracy:.4f}")
+
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.training.lr))
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
 
     for epoch in range(int(cfg.training.epochs)):
