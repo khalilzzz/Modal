@@ -12,7 +12,7 @@ training:
   optimizer: adam
   weight_decay: 0.0
   # Augmentation toggles (applied only during training, never on val/test)
-  use_horizontal_flip: true
+  use_horizontal_flip: false
   use_random_crop: false
   random_crop_scale: [0.7, 1.0]
   use_color_jitter: false

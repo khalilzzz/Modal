@@ -11,6 +11,9 @@ dependencies = [
     "hydra-core>=1.3.0",
     "omegaconf>=2.3.0",
     "pillow>=10.0.0",
+    # Track B (open world): HuggingFace transformers for pretrained video models
+    # (VideoMAE, TimeSformer). Used by models whose name starts with ``a_``.
+    "transformers>=4.40.0",
 ]
 
 [tool.uv]

@@ -32,6 +32,9 @@ from models.cnn_transformer import CNNTransformer
 from models.two_stream_transformer import TwoStreamTransformer
 from utils import build_transforms, set_seed, split_train_val
 
+# Track B (open world) models (prefixed with "b_") — lazy imports inside
+# build_model so Track A users don't need the extra transformers dependency.
+
 
 def build_model(cfg: DictConfig) -> nn.Module:
     """Create the model described by cfg.model.name."""
@@ -68,6 +71,33 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_layers=int(cfg.model.get("num_layers", 4)),
             dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
             dropout=float(cfg.model.get("dropout", 0.2)),
+        )
+
+    # Track B (open world) models. Prefixed with "b_" by convention.
+    # Lazy import keeps the transformers dependency optional for Track A.
+    if name == "b_videomae":
+        from models.b_videomae import VideoMAEClassifier
+
+        return VideoMAEClassifier(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            model_id=str(
+                cfg.model.get("model_id", "MCG-NJU/videomae-base-finetuned-ssv2")
+            ),
+            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
+            freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
+        )
+    if name == "b_timesformer":
+        from models.b_timesformer import TimeSformerClassifier
+
+        return TimeSformerClassifier(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            model_id=str(
+                cfg.model.get("model_id", "facebook/timesformer-base-finetuned-ssv2")
+            ),
+            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
+            freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
         )
 
     raise ValueError(f"Unknown model.name: {name}")
@@ -206,7 +236,9 @@ def main(cfg: DictConfig) -> None:
         "pin_memory": (device.type == "cuda"),
     }
     if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["persistent_workers"] = bool(
+            cfg.training.get("persistent_workers", False)
+        )
         loader_kwargs["prefetch_factor"] = int(
             cfg.training.get("prefetch_factor", 4)
         )
