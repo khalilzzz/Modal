@@ -32,8 +32,8 @@ from models.cnn_transformer import CNNTransformer
 from models.two_stream_transformer import TwoStreamTransformer
 from utils import build_transforms, set_seed, split_train_val
 
-# Track B (open world) models (prefixed with "b_") — lazy imports inside
-# build_model so Track A users don't need the extra transformers dependency.
+# Track B (open world) models — lazy imports inside build_model so Track A users
+# don't need to install the extra transformers/huggingface dependency.
 
 
 def build_model(cfg: DictConfig) -> nn.Module:
@@ -73,10 +73,10 @@ def build_model(cfg: DictConfig) -> nn.Module:
             dropout=float(cfg.model.get("dropout", 0.2)),
         )
 
-    # Track B (open world) models. Prefixed with "b_" by convention.
+    # Track B (open world) models. Prefixed with "a_" by convention.
     # Lazy import keeps the transformers dependency optional for Track A.
-    if name == "b_videomae":
-        from models.b_videomae import VideoMAEClassifier
+    if name == "a_videomae":
+        from models.a_videomae import VideoMAEClassifier
 
         return VideoMAEClassifier(
             num_classes=num_classes,
@@ -87,8 +87,8 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
             freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
         )
-    if name == "b_timesformer":
-        from models.b_timesformer import TimeSformerClassifier
+    if name == "a_timesformer":
+        from models.a_timesformer import TimeSformerClassifier
 
         return TimeSformerClassifier(
             num_classes=num_classes,
@@ -207,7 +207,7 @@ def main(cfg: DictConfig) -> None:
     train_transform = build_transforms(
         is_training=True,
         use_imagenet_norm=use_imagenet_norm,
-        use_horizontal_flip=bool(cfg.training.get("use_horizontal_flip", True)),
+        use_horizontal_flip=bool(cfg.training.get("use_horizontal_flip", False)),
         use_random_crop=bool(cfg.training.get("use_random_crop", False)),
         random_crop_scale=tuple(cfg.training.get("random_crop_scale", (0.7, 1.0))),
         use_color_jitter=bool(cfg.training.get("use_color_jitter", False)),
@@ -268,7 +268,7 @@ def main(cfg: DictConfig) -> None:
         best_val_accuracy = float(ckpt.get("val_accuracy", 0.0))
         print(f"Resuming best val accuracy from checkpoint: {best_val_accuracy:.4f}")
 
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer_name = str(cfg.training.get("optimizer", "adam")).lower()
     weight_decay = float(cfg.training.get("weight_decay", 0.0))
     lr = float(cfg.training.lr)
