@@ -7,10 +7,10 @@ Pipeline (see two_stream_transformer_design.md for the full rationale):
     Motion stream CNN + spatial self-attention -> (B, T, C_mot)
         (motion input = frame[t] - frame[t-1], zero for t=0)
     Concat -> Linear projection -> (B, T, d_model)
+    Prepend learnable [CLS] -> (B, T+1, d_model)
     + sinusoidal positional encoding
     Transformer encoder (multi-head self-attention + FFN, pre-norm)
-    Mean pool over T -> (B, d_model)
-    Linear -> (B, num_classes)
+    [CLS] -> Linear -> (B, num_classes)
 """
 
 from __future__ import annotations
@@ -154,6 +154,9 @@ class TwoStreamTransformer(nn.Module):
         self.frame_proj = nn.Linear(fused_dim, d_model)
         self.frame_dropout = nn.Dropout(dropout)
 
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
         self.pos_enc = _SinusoidalPositionalEncoding(d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -190,12 +193,13 @@ class TwoStreamTransformer(nn.Module):
         tokens = self.frame_proj(fused)                       # (B, T, d_model)
         tokens = self.frame_dropout(tokens)
 
-        # --- Positional encoding -----------------------------------------
-        seq = self.pos_enc(tokens)                           # (B, T, d_model)
+        # --- Prepend [CLS] + positional encoding -------------------------
+        cls = self.cls_token.expand(B, -1, -1)               # (B, 1, d_model)
+        seq = torch.cat([cls, tokens], dim=1)                # (B, T+1, d_model)
+        seq = self.pos_enc(seq)
 
         # --- Temporal Transformer ----------------------------------------
-        seq = self.transformer(seq)                          # (B, T, d_model)
+        seq = self.transformer(seq)
         seq = self.out_norm(seq)
 
-        pooled = seq.mean(dim=1)                             # (B, d_model)
-        return self.classifier(pooled)                       # (B, num_classes)
+        return self.classifier(seq[:, 0])                    # [CLS] -> logits

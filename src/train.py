@@ -22,6 +22,7 @@ import hydra
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
@@ -78,6 +79,8 @@ def train_one_epoch(
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scaler: GradScaler,
+    use_amp: bool,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the training set for one epoch."""
     model.train()
@@ -87,14 +90,16 @@ def train_one_epoch(
 
     for video_batch, labels in data_loader:
         # video_batch: (B, T, C, H, W), labels: (B,)
-        video_batch = video_batch.to(device)
-        labels = labels.to(device)
+        video_batch = video_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        logits = model(video_batch)  # (B, num_classes)
-        loss = loss_fn(logits, labels)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type=device.type, enabled=use_amp):
+            logits = model(video_batch)  # (B, num_classes)
+            loss = loss_fn(logits, labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
@@ -112,6 +117,7 @@ def evaluate_epoch(
     data_loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
+    use_amp: bool,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the validation loader."""
     model.eval()
@@ -120,11 +126,12 @@ def evaluate_epoch(
     total = 0
 
     for video_batch, labels in data_loader:
-        video_batch = video_batch.to(device)
-        labels = labels.to(device)
+        video_batch = video_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        logits = model(video_batch)
-        loss = loss_fn(logits, labels)
+        with autocast(device_type=device.type, enabled=use_amp):
+            logits = model(video_batch)
+            loss = loss_fn(logits, labels)
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
@@ -147,6 +154,10 @@ def main(cfg: DictConfig) -> None:
         print("CUDA not available; using CPU.")
         device_str = "cpu"
     device = torch.device(device_str)
+
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
 
     train_dir = Path(cfg.dataset.train_dir).resolve()
     all_samples = collect_video_samples(train_dir)
@@ -189,19 +200,28 @@ def main(cfg: DictConfig) -> None:
         sample_list=val_samples,
     )
 
+    num_workers = int(cfg.training.num_workers)
+    loader_kwargs: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": (device.type == "cuda"),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = int(
+            cfg.training.get("prefetch_factor", 4)
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(cfg.training.batch_size),
         shuffle=True,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(cfg.training.batch_size),
         shuffle=False,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
+        **loader_kwargs,
     )
 
     model = build_model(cfg).to(device)
@@ -235,11 +255,17 @@ def main(cfg: DictConfig) -> None:
     )
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
 
+    use_amp = bool(cfg.training.get("use_amp", True)) and device.type == "cuda"
+    scaler = GradScaler(device.type, enabled=use_amp)
+    print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
+
     for epoch in range(int(cfg.training.epochs)):
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, loss_fn, optimizer, device
+            model, train_loader, loss_fn, optimizer, device, scaler, use_amp
         )
-        val_loss, val_acc = evaluate_epoch(model, val_loader, loss_fn, device)
+        val_loss, val_acc = evaluate_epoch(
+            model, val_loader, loss_fn, device, use_amp
+        )
 
         print(
             f"Epoch {epoch + 1}/{cfg.training.epochs} | "
