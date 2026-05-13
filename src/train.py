@@ -164,7 +164,13 @@ def main(cfg: DictConfig) -> None:
     # Match normalization to pretrained flag (ImageNet stats when using pretrained weights).
     use_imagenet_norm = bool(cfg.model.pretrained)
     train_transform = build_transforms(
-        is_training=True, use_imagenet_norm=use_imagenet_norm
+        is_training=True,
+        use_imagenet_norm=use_imagenet_norm,
+        use_horizontal_flip=bool(cfg.training.get("use_horizontal_flip", True)),
+        use_random_crop=bool(cfg.training.get("use_random_crop", False)),
+        random_crop_scale=tuple(cfg.training.get("random_crop_scale", (0.7, 1.0))),
+        use_color_jitter=bool(cfg.training.get("use_color_jitter", False)),
+        color_jitter_strength=float(cfg.training.get("color_jitter_strength", 0.2)),
     )
     eval_transform = build_transforms(
         is_training=False, use_imagenet_norm=use_imagenet_norm
@@ -211,7 +217,22 @@ def main(cfg: DictConfig) -> None:
         print(f"Resuming best val accuracy from checkpoint: {best_val_accuracy:.4f}")
 
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.training.lr))
+    optimizer_name = str(cfg.training.get("optimizer", "adam")).lower()
+    weight_decay = float(cfg.training.get("weight_decay", 0.0))
+    lr = float(cfg.training.lr)
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=weight_decay
+        )
+    elif optimizer_name == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=weight_decay
+        )
+    else:
+        raise ValueError(f"Unknown training.optimizer: {optimizer_name}")
+    print(
+        f"Optimizer: {optimizer_name} (lr={lr}, weight_decay={weight_decay})"
+    )
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
 
     for epoch in range(int(cfg.training.epochs)):

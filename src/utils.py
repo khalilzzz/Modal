@@ -26,6 +26,11 @@ def build_transforms(
     image_size: int = 224,
     is_training: bool = True,
     use_imagenet_norm: bool = True,
+    use_horizontal_flip: bool = True,
+    use_random_crop: bool = False,
+    random_crop_scale: Tuple[float, float] = (0.7, 1.0),
+    use_color_jitter: bool = False,
+    color_jitter_strength: float = 0.2,
 ) -> transforms.Compose:
     """
     Standard torchvision pipeline for single RGB frames.
@@ -33,6 +38,10 @@ def build_transforms(
     use_imagenet_norm:
         True  -> mean/std from ImageNet (usual when pretrained=True)
         False -> still scale to [0,1]; you can swap norms if you prefer
+    use_random_crop:
+        True -> RandomResizedCrop with given scale range (training only)
+    use_color_jitter:
+        True -> apply brightness/contrast/saturation jitter (training only)
     """
     if use_imagenet_norm:
         normalize = transforms.Normalize(
@@ -43,14 +52,27 @@ def build_transforms(
         normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
     if is_training:
-        return transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size)),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]
-        )
+        train_ops: List = []
+        if use_random_crop:
+            train_ops.append(
+                transforms.RandomResizedCrop(
+                    image_size, scale=tuple(random_crop_scale), ratio=(0.85, 1.15)
+                )
+            )
+        else:
+            train_ops.append(transforms.Resize((image_size, image_size)))
+
+        if use_horizontal_flip:
+            train_ops.append(transforms.RandomHorizontalFlip())
+
+        if use_color_jitter:
+            s = float(color_jitter_strength)
+            train_ops.append(
+                transforms.ColorJitter(brightness=s, contrast=s, saturation=s, hue=s * 0.5)
+            )
+
+        train_ops += [transforms.ToTensor(), normalize]
+        return transforms.Compose(train_ops)
 
     return transforms.Compose(
         [
