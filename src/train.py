@@ -73,10 +73,10 @@ def build_model(cfg: DictConfig) -> nn.Module:
             dropout=float(cfg.model.get("dropout", 0.2)),
         )
 
-    # Track B (open world) models. Prefixed with "a_" by convention.
+    # Track B (open world) models. Prefixed with "b_" by convention.
     # Lazy import keeps the transformers dependency optional for Track A.
-    if name == "a_videomae":
-        from models.a_videomae import VideoMAEClassifier
+    if name == "b_videomae":
+        from models.b_videomae import VideoMAEClassifier
 
         return VideoMAEClassifier(
             num_classes=num_classes,
@@ -87,8 +87,8 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
             freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
         )
-    if name == "a_timesformer":
-        from models.a_timesformer import TimeSformerClassifier
+    if name == "b_timesformer":
+        from models.b_timesformer import TimeSformerClassifier
 
         return TimeSformerClassifier(
             num_classes=num_classes,
