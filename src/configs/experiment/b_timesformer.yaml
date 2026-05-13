@@ -4,11 +4,12 @@ defaults:
   - override /model: b_timesformer
 
 dataset:
-  num_frames: 8
+  # The dataset has exactly 4 frames per video — match the model.
+  num_frames: 4
 
 training:
   epochs: 5
-  batch_size: 24          # roomier than VideoMAE (only 8 frames per clip)
+  batch_size: 64          # 4 frames is light on VRAM; tune up if you can
   lr: 5.0e-5
   optimizer: adamw
   weight_decay: 0.05

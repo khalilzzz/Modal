@@ -8,6 +8,8 @@ model:
   num_classes: ${num_classes}
   # HuggingFace checkpoint. Alternative: facebook/timesformer-hr-finetuned-ssv2 (higher resolution).
   model_id: facebook/timesformer-base-finetuned-ssv2
-  # Native frame count for this checkpoint. Match dataset.num_frames if you change it.
-  num_frames: 8
+  # The challenge's processed_data only provides 4 frames per video. Loading
+  # TimeSformer with num_frames=4 truncates the temporal positional embeddings
+  # (native was 8). Loss is minor — only the temporal pos table is affected.
+  num_frames: 4
   freeze_backbone: false

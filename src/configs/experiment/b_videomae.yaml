@@ -5,12 +5,12 @@ defaults:
   - override /model: b_videomae
 
 dataset:
-  # VideoMAE base was trained with 16 frames; keep it consistent.
-  num_frames: 16
+  # The dataset has exactly 4 frames per video — match the model.
+  num_frames: 4
 
 training:
   epochs: 5
-  batch_size: 16          # transformer + 16 frames is VRAM-heavy; tune up if you can
+  batch_size: 48          # 4 frames is light on VRAM; tune up if you can
   lr: 5.0e-5              # low LR is critical for fine-tuning pretrained transformers
   optimizer: adamw
   weight_decay: 0.05
