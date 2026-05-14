@@ -225,8 +225,17 @@ def main(cfg: DictConfig) -> None:
         use_horizontal_flip=bool(cfg.training.get("use_horizontal_flip", False)),
         use_random_crop=bool(cfg.training.get("use_random_crop", False)),
         random_crop_scale=tuple(cfg.training.get("random_crop_scale", (0.7, 1.0))),
+        random_crop_ratio=tuple(cfg.training.get("random_crop_ratio", (0.85, 1.15))),
         use_color_jitter=bool(cfg.training.get("use_color_jitter", False)),
         color_jitter_strength=float(cfg.training.get("color_jitter_strength", 0.2)),
+        use_random_erasing=bool(cfg.training.get("use_random_erasing", False)),
+        random_erasing_p=float(cfg.training.get("random_erasing_p", 0.25)),
+        random_erasing_scale=tuple(
+            cfg.training.get("random_erasing_scale", (0.02, 0.2))
+        ),
+        random_erasing_ratio=tuple(
+            cfg.training.get("random_erasing_ratio", (0.3, 3.3))
+        ),
     )
     eval_transform = build_transforms(
         is_training=False, use_imagenet_norm=use_imagenet_norm

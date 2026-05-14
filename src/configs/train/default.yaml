@@ -8,12 +8,20 @@ training:
   checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
   device: cuda
   resume_checkpoint: null
-  # Optimizer: "adam" or "adamw". AdamW applies decoupled weight decay.
+  # Optimizer: "adam", "adamw", or "sgd". AdamW applies decoupled weight decay.
   optimizer: adam
   weight_decay: 0.0
-  # Augmentation toggles (applied only during training, never on val/test)
+  # Augmentation toggles (applied only during training, never on val/test).
+  # The random params below are sampled ONCE per clip and applied identically
+  # to every frame — temporal consistency is preserved.
   use_horizontal_flip: false
   use_random_crop: false
   random_crop_scale: [0.7, 1.0]
+  random_crop_ratio: [0.85, 1.15]
   use_color_jitter: false
   color_jitter_strength: 0.2
+  # Random erasing: zero out a random rectangle, same rectangle across all frames.
+  use_random_erasing: false
+  random_erasing_p: 0.25
+  random_erasing_scale: [0.02, 0.2]
+  random_erasing_ratio: [0.3, 3.3]
