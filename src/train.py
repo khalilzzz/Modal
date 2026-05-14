@@ -114,6 +114,19 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
             freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
         )
+    if name == "b_vjepa2":
+        from models.b_vjepa2 import VJEPA2Classifier
+
+        return VJEPA2Classifier(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            model_id=str(
+                cfg.model.get("model_id", "facebook/vjepa2-vitl-fpc16-256-ssv2")
+            ),
+            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
+            image_size=int(cfg.model.get("image_size", 256)),
+            freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
+        )
 
     raise ValueError(f"Unknown model.name: {name}")
 
