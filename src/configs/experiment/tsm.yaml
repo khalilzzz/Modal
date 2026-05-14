@@ -4,7 +4,7 @@ defaults:
   - override /model: tsm
 
 dataset:
-  num_frames: 10         # must match model.num_segments
+  num_frames: 4          # must match model.num_segments — pinned at 4 project-wide
 
 training:
   epochs: 10

@@ -11,9 +11,9 @@ Why TimeSformer for this challenge:
     Something-Something V2 task — same data family as our challenge.
 
 Notable difference vs VideoMAE:
-    TimeSformer expects exactly ``num_frames=8`` (matches the dataset default),
-    while VideoMAE expects 16. So this model is the natural choice if you want
-    to keep ``dataset.num_frames=8``.
+    TimeSformer's native ``num_frames`` is 8 and VideoMAE's is 16. The project's
+    ``processed_data`` only ships 4 frames per clip, so the wrapper interpolates
+    the pretrained temporal embeddings down to ``num_frames=4`` (see below).
 
 Input / output:
     forward(video) takes ``(B, T, C, H, W)`` with ImageNet-normalized RGB frames
@@ -33,7 +33,7 @@ class TimeSformerClassifier(nn.Module):
         num_classes: int,
         pretrained: bool = True,
         model_id: str = "facebook/timesformer-base-finetuned-ssv2",
-        num_frames: int = 8,
+        num_frames: int = 4,
         freeze_backbone: bool = False,
     ) -> None:
         super().__init__()

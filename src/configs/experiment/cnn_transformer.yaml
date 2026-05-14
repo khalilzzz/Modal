@@ -3,6 +3,10 @@
 defaults:
   - override /model: cnn_transformer
 
+dataset:
+  # The dataset has exactly 4 frames per video — keep this in sync everywhere.
+  num_frames: 4
+
 training:
   epochs: 10
   batch_size: 64

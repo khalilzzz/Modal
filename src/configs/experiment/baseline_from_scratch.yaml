@@ -2,3 +2,6 @@
 # Baseline experiment: ResNet18 + temporal average pooling
 defaults:
   - override /model: cnn_baseline
+
+dataset:
+  num_frames: 4

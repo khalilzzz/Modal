@@ -93,7 +93,7 @@ class TSM(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        num_segments: int = 8,
+        num_segments: int = 4,
         pretrained: bool = False,  # accepted for API compatibility — Track A ignores it
         base_channels: int = 64,
         dropout: float = 0.5,

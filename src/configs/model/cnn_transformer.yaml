@@ -1,5 +1,6 @@
 # @package _global_
 # ResNet18 per frame + Transformer encoder over time (Track A: pretrained=false)
+# See models/cnn_transformer.py for the design rationale (anticipation-aware).
 model:
   name: cnn_transformer
   pretrained: false
@@ -8,3 +9,15 @@ model:
   num_layers: 2
   dim_feedforward: 1024
   dropout: 0.1
+  # Must match dataset.num_frames. The whole project is pinned to 4 frames.
+  num_frames: 4
+  # Keep the ResNet18 7x7 spatial grid (49 tokens/frame) instead of GAP-ing it
+  # to a single vector. T*49 + 1 = 197 tokens per clip with T=4.
+  use_spatial_tokens: true
+  # Bidirectional attention is fine for this dataset (all input frames are
+  # observed; no future leakage). Flip to true for a strict anticipation setup.
+  causal: false
+  # "cls"  : learnable anticipation token appended at the end (recommended)
+  # "last" : pool the last observed frame's tokens
+  # "mean" : mean over all tokens (the old, weaker baseline)
+  pool: cls

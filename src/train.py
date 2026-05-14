@@ -60,6 +60,10 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_layers=int(cfg.model.get("num_layers", 2)),
             dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
             dropout=float(cfg.model.get("dropout", 0.1)),
+            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
+            use_spatial_tokens=bool(cfg.model.get("use_spatial_tokens", True)),
+            causal=bool(cfg.model.get("causal", False)),
+            pool=str(cfg.model.get("pool", "cls")),
         )
     if name == "two_stream_transformer":
         return TwoStreamTransformer(

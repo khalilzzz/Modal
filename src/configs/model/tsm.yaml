@@ -7,7 +7,8 @@ model:
   pretrained: false
   num_classes: ${num_classes}
   # Number of frames per clip. MUST equal dataset.num_frames (asserted at forward).
-  num_segments: 8
+  # Pinned to 4 because the processed_data folders contain exactly 4 frames.
+  num_segments: 4
   # ResNet18 base channels (final feature dim = base_channels * 8 = 512 by default).
   base_channels: 64
   # Dropout applied just before the classifier.

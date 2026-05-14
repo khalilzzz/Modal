@@ -3,6 +3,9 @@
 defaults:
   - override /model: two_stream_transformer
 
+dataset:
+  num_frames: 4
+
 training:
   epochs: 10
   batch_size: 64

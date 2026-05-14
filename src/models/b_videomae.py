@@ -36,7 +36,7 @@ class VideoMAEClassifier(nn.Module):
         num_classes: int,
         pretrained: bool = True,
         model_id: str = "MCG-NJU/videomae-base-finetuned-ssv2",
-        num_frames: int = 16,
+        num_frames: int = 4,
         freeze_backbone: bool = False,
     ) -> None:
         super().__init__()
