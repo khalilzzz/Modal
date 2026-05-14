@@ -1,39 +1,34 @@
 #!/usr/bin/env python3
 """
-Ensemble prediction: average the softmax outputs of N trained checkpoints over
-the test split, then take argmax to produce a single submission CSV (same
-format as ``create_submission.py``).
+Ensemble prediction / evaluation: average the softmax outputs of N trained
+checkpoints. Two modes:
+
+  - **Submission mode** (default): runs over ``dataset.test_dir`` (no labels)
+    and writes a CSV in the same format as ``create_submission.py``
+    (``video_name,predicted_class``).
+
+  - **Eval mode** (``--eval-dir PATH``): runs over a labelled directory
+    (same layout as ``dataset.val_dir``) and reports **top-1 / top-5**
+    accuracy for each individual model AND for the ensemble. No CSV.
 
 Reuses helpers from ``create_submission.py`` by import — no edits to that file.
 
 Examples:
-    # Average 3 TSM runs with different seeds
+    # Submission: average 3 TSM checkpoints, write a CSV
     uv run python src/ensemble_predict.py \\
         --checkpoints tsm_a.pt tsm_b.pt tsm_c.pt \\
         --output submission_ensemble.csv
 
-    # Weighted ensemble (e.g., give twice the weight to the strongest model)
+    # Eval on the validation set — prints top-1 / top-5 per model AND ensemble
     uv run python src/ensemble_predict.py \\
-        --checkpoints tsm_a.pt tsm_b.pt videomae.pt \\
-        --weights 1.0 1.0 2.0 \\
-        --output submission_mixed.csv
+        --checkpoints tsm_a.pt tsm_b.pt tsm_c.pt \\
+        --eval-dir processed_data/val
 
-    # Override test paths and runtime knobs
+    # Weighted ensemble in eval mode
     uv run python src/ensemble_predict.py \\
-        --checkpoints a.pt b.pt \\
-        --test-dir /path/to/test \\
-        --batch-size 64 --num-workers 10 --device cuda
-
-What the script does, in order:
-  1. Discovers all ``video_*`` folders under --test-dir (or uses --test-manifest
-     for an explicit ordering), via helpers re-imported from create_submission.
-  2. For each checkpoint, loads the model with its saved Hydra config, runs
-     inference over the entire test set, collects softmax probabilities.
-  3. Averages the softmaxes across checkpoints (weighted if --weights is set).
-  4. Prints diagnostic stats: how often models agree, per-model agreement with
-     the final ensemble, class distribution of predictions.
-  5. Writes the CSV with the same header as create_submission.py
-     (``video_name,predicted_class``).
+        --checkpoints tsm_weak.pt tsm_strong.pt \\
+        --weights 1.0 2.0 \\
+        --eval-dir processed_data/val
 """
 
 from __future__ import annotations
@@ -48,7 +43,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from dataset.video_dataset import VideoFrameDataset
+from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from train import build_model
 from utils import build_transforms
 
@@ -80,22 +75,32 @@ def parse_args() -> argparse.Namespace:
         "Must match --checkpoints length.",
     )
     p.add_argument(
+        "--eval-dir",
+        type=str,
+        default=None,
+        help="If set: evaluate on this labelled directory (same layout as "
+        "dataset.val_dir), print top-1 / top-5 per model AND ensemble. "
+        "No CSV is written in this mode.",
+    )
+    p.add_argument(
         "--test-dir",
         type=str,
         default=None,
-        help="Path to test root. Defaults to dataset.test_dir from the FIRST checkpoint's config.",
+        help="Submission mode: path to test root. Defaults to dataset.test_dir "
+        "from the FIRST checkpoint's config. Ignored if --eval-dir is set.",
     )
     p.add_argument(
         "--test-manifest",
         type=str,
         default=None,
-        help="Optional manifest CSV with a 'video_name' column for clip ordering.",
+        help="Submission mode: optional manifest CSV with a 'video_name' column "
+        "for clip ordering. Ignored if --eval-dir is set.",
     )
     p.add_argument(
         "--output",
         type=str,
         default="submission_ensemble.csv",
-        help="Output CSV path.",
+        help="Submission mode: output CSV path.",
     )
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--num-workers", type=int, default=10)
@@ -103,9 +108,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--save-per-model-softmax",
         action="store_true",
-        help="Also save each model's individual softmax tensor (B, num_classes) to disk "
-        "next to --output, under a per_model/ folder. Useful for offline analysis or "
-        "for re-running the ensembling with different weights without redoing inference.",
+        help="Also save each model's individual softmax tensor (B, num_classes) "
+        "to disk under a per_model/ folder next to --output (submission mode) "
+        "or in the current directory (eval mode).",
     )
     return p.parse_args()
 
@@ -113,8 +118,8 @@ def parse_args() -> argparse.Namespace:
 def _load_model_and_meta(
     checkpoint_path: Path, device: torch.device
 ) -> Tuple[torch.nn.Module, Dict[str, Any]]:
-    """Load a checkpoint and return (model, meta) where meta carries the
-    runtime knobs needed to build a matching DataLoader.
+    """Load a checkpoint and return (model, meta) where meta carries the runtime
+    knobs needed to build a matching DataLoader (num_frames, pretrained, ...).
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     if "config" not in ckpt or ckpt["config"] is None:
@@ -136,30 +141,44 @@ def _load_model_and_meta(
 
 
 @torch.no_grad()
-def _run_inference_softmax(
+def _run_inference(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     total_videos: int,
-) -> torch.Tensor:
-    """Run inference; return softmax tensor of shape (N_videos, num_classes), CPU."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run inference; return (softmax, labels) both on CPU.
+
+    Labels are whatever the dataset's sample_list contains (true labels in eval
+    mode, dummy 0s in submission mode).
+    """
     model.eval()
-    chunks: List[torch.Tensor] = []
+    probs_chunks: List[torch.Tensor] = []
+    label_chunks: List[torch.Tensor] = []
     n_batches = len(loader)
     log_interval = max(1, n_batches // 10)
-    for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
+    for batch_idx, (video_batch, labels) in enumerate(loader, start=1):
         video_batch = video_batch.to(device)
         logits = model(video_batch)
         probs = F.softmax(logits, dim=-1).cpu()
-        chunks.append(probs)
+        probs_chunks.append(probs)
+        label_chunks.append(labels.cpu())
         if batch_idx % log_interval == 0 or batch_idx == n_batches:
             print(f"    inference batch {batch_idx}/{n_batches}", flush=True)
-    out = torch.cat(chunks, dim=0)
+    out = torch.cat(probs_chunks, dim=0)
+    labels_out = torch.cat(label_chunks, dim=0)
     if out.size(0) != total_videos:
         raise RuntimeError(
             f"Got {out.size(0)} softmax rows but expected {total_videos} clips."
         )
-    return out
+    return out, labels_out
+
+
+def _topk_accuracy(softmax: torch.Tensor, labels: torch.Tensor, k: int) -> float:
+    """Top-k accuracy in [0, 1]."""
+    _, topk = softmax.topk(k, dim=-1, largest=True, sorted=True)
+    correct = topk.eq(labels.view(-1, 1)).any(dim=1)
+    return float(correct.float().mean().item())
 
 
 def _resolve_test_root(args: argparse.Namespace) -> Path:
@@ -176,37 +195,51 @@ def _print_agreement_stats(
     ensemble_preds: List[int],
     num_classes: int,
 ) -> None:
-    """Print diagnostics about how the ensemble decided."""
+    """Diagnostic: how often models agree among themselves and with the ensemble."""
     n_clips = len(ensemble_preds)
     n_models = len(per_model_preds)
 
-    print(f"\n=== Ensemble statistics ({n_models} model(s), {n_clips} clip(s)) ===")
-
+    print(f"\n=== Ensemble agreement stats ({n_models} model(s), {n_clips} clip(s)) ===")
     if n_models >= 2:
-        # (n_models, n_clips)
         per_model_tensor = torch.tensor(list(per_model_preds.values()))
-        # All models picked the same class on this clip?
         first_row = per_model_tensor[0:1]
         all_agree = (per_model_tensor == first_row).all(dim=0).sum().item()
         print(
             f"All models agree on:      {all_agree}/{n_clips} clips "
             f"({100*all_agree/n_clips:.1f}%)"
         )
-
-        # Per-model agreement with the final ensemble pick
         ensemble_tensor = torch.tensor(ensemble_preds)
         for i, name in enumerate(per_model_preds.keys()):
             match = (per_model_tensor[i] == ensemble_tensor).sum().item()
             print(
                 f"  {name:30s} agrees with ensemble on {100*match/n_clips:5.1f}% of clips"
             )
-
     bins = torch.bincount(torch.tensor(ensemble_preds), minlength=num_classes)
     distinct = (bins > 0).sum().item()
     top_class = int(bins.argmax().item())
     top_count = int(bins.max().item())
     print(f"Distinct classes in ensemble predictions: {distinct}/{num_classes}")
     print(f"Most-predicted class index: {top_class}  ({top_count} clips)")
+
+
+def _print_accuracy_metrics(
+    per_model_softmax: Dict[str, torch.Tensor],
+    ensemble_softmax: torch.Tensor,
+    true_labels: torch.Tensor,
+) -> None:
+    """Print top-1 / top-5 for each individual model and for the ensemble."""
+    n_clips = int(true_labels.size(0))
+    print(f"\n=== Accuracy on {n_clips} labelled clips ===")
+    print(f"  {'model':30s}   top-1     top-5")
+    print(f"  {'-'*30}   ------    ------")
+    for name, probs in per_model_softmax.items():
+        t1 = _topk_accuracy(probs, true_labels, 1)
+        t5 = _topk_accuracy(probs, true_labels, 5)
+        print(f"  {name:30s}   {t1:.4f}    {t5:.4f}")
+    e_t1 = _topk_accuracy(ensemble_softmax, true_labels, 1)
+    e_t5 = _topk_accuracy(ensemble_softmax, true_labels, 5)
+    print(f"  {'-'*30}   ------    ------")
+    print(f"  {'ENSEMBLE':30s}   {e_t1:.4f}    {e_t5:.4f}")
 
 
 def main() -> None:
@@ -224,26 +257,38 @@ def main() -> None:
         device_str = "cpu"
     device = torch.device(device_str)
 
-    test_root = _resolve_test_root(args)
-    print(f"Test root: {test_root}", flush=True)
+    eval_mode = args.eval_dir is not None
 
-    if args.test_manifest:
-        manifest_path = Path(args.test_manifest).resolve()
-        print(f"Reading manifest: {manifest_path}", flush=True)
-        video_names = load_manifest_video_names(manifest_path)
-        video_dirs = resolve_video_dirs(test_root, video_names)
+    # ---- Resolve clip list (and labels, if eval mode) --------------------
+    if eval_mode:
+        eval_root = Path(args.eval_dir).resolve()
+        print(f"Eval mode: {eval_root}", flush=True)
+        samples = collect_video_samples(eval_root)
+        sample_list: List[Tuple[Path, int]] = list(samples)
+        video_names = [p.name for p, _ in sample_list]
+        clip_root = eval_root
+        print(f"Labelled clips: {len(sample_list)}", flush=True)
     else:
-        print(
-            "No manifest provided; using all video_* folders found under test_dir.",
-            flush=True,
-        )
-        video_names, video_dirs = discover_all_test_videos(test_root)
+        clip_root = _resolve_test_root(args)
+        print(f"Submission mode — test root: {clip_root}", flush=True)
+        if args.test_manifest:
+            manifest_path = Path(args.test_manifest).resolve()
+            print(f"Reading manifest: {manifest_path}", flush=True)
+            video_names = load_manifest_video_names(manifest_path)
+            video_dirs = resolve_video_dirs(clip_root, video_names)
+        else:
+            print(
+                "No manifest provided; using all video_* folders under test_dir.",
+                flush=True,
+            )
+            video_names, video_dirs = discover_all_test_videos(clip_root)
+        sample_list = [(p, 0) for p in video_dirs]
+        print(f"Test clips: {len(sample_list)}", flush=True)
 
-    print(f"Test clips: {len(video_dirs)}", flush=True)
-    sample_list: List[Tuple[Path, int]] = [(p, 0) for p in video_dirs]
-
+    # ---- Run each checkpoint sequentially --------------------------------
     softmax_accumulator: Optional[torch.Tensor] = None
-    per_model_preds: Dict[str, List[int]] = {}
+    per_model_softmax: Dict[str, torch.Tensor] = {}
+    true_labels: Optional[torch.Tensor] = None
     num_classes: Optional[int] = None
 
     for idx, (ckpt_path_str, w) in enumerate(
@@ -269,7 +314,7 @@ def main() -> None:
             is_training=False, use_imagenet_norm=meta["pretrained"]
         )
         dataset = VideoFrameDataset(
-            root_dir=test_root,
+            root_dir=clip_root,
             num_frames=meta["num_frames"],
             transform=transform,
             sample_list=sample_list,
@@ -287,17 +332,20 @@ def main() -> None:
             f"batch_size={args.batch_size}",
             flush=True,
         )
-        probs = _run_inference_softmax(
+        probs, labels = _run_inference(
             model, loader, device, total_videos=len(dataset)
-        )  # (N_clips, num_classes)
+        )  # (N_clips, num_classes), (N_clips,)
 
         if num_classes is None:
             num_classes = int(probs.size(1))
+        if true_labels is None:
+            true_labels = labels  # constant across models
 
-        per_model_preds[ckpt_path.name] = probs.argmax(dim=-1).tolist()
+        per_model_softmax[ckpt_path.name] = probs
 
         if args.save_per_model_softmax:
-            out_dir = Path(args.output).resolve().parent / "per_model"
+            base_dir = Path(args.output).resolve().parent if not eval_mode else Path.cwd()
+            out_dir = base_dir / "per_model"
             out_dir.mkdir(parents=True, exist_ok=True)
             torch.save(probs, out_dir / f"{ckpt_path.stem}_softmax.pt")
             print(
@@ -315,22 +363,32 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     assert softmax_accumulator is not None and num_classes is not None
+    assert true_labels is not None
 
     total_weight = float(sum(weights))
     ensemble_softmax = softmax_accumulator / total_weight  # (N_clips, num_classes)
     ensemble_preds = ensemble_softmax.argmax(dim=-1).tolist()
 
+    # ---- Diagnostics + outputs -------------------------------------------
+    per_model_preds = {
+        name: probs.argmax(dim=-1).tolist() for name, probs in per_model_softmax.items()
+    }
     _print_agreement_stats(per_model_preds, ensemble_preds, num_classes)
 
-    output_path = Path(args.output).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"\nWriting submission to: {output_path}")
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["video_name", "predicted_class"])  # match create_submission.py
-        for name, pred in zip(video_names, ensemble_preds):
-            writer.writerow([name, pred])
-    print(f"Done. Wrote {len(ensemble_preds)} rows.")
+    if eval_mode:
+        _print_accuracy_metrics(per_model_softmax, ensemble_softmax, true_labels)
+        # No CSV in eval mode — the user asked for pure accuracy.
+        print("\nEval mode — no submission CSV written.")
+    else:
+        output_path = Path(args.output).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"\nWriting submission to: {output_path}")
+        with output_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["video_name", "predicted_class"])  # match create_submission.py
+            for name, pred in zip(video_names, ensemble_preds):
+                writer.writerow([name, pred])
+        print(f"Done. Wrote {len(ensemble_preds)} rows.")
 
 
 if __name__ == "__main__":
