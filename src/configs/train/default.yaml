@@ -25,3 +25,19 @@ training:
   random_erasing_p: 0.25
   random_erasing_scale: [0.02, 0.2]
   random_erasing_ratio: [0.3, 3.3]
+  # Small rotation: same angle across all 4 frames. Big angles break SSv2.
+  use_rotation: false
+  rotation_degrees: 5.0
+  # Sharpness: factor sampled in [1-s, 1+s]; same factor across all 4 frames.
+  use_sharpness: false
+  sharpness_strength: 0.5
+  # Gaussian blur: probabilistic, same sigma across all 4 frames.
+  use_blur: false
+  blur_p: 0.2
+  blur_kernel: 5
+  blur_sigma: [0.1, 1.5]
+  # Class-imbalanced sampling: oversample clips from rare classes per epoch.
+  # method "sqrt" (recommended) uses w ~ 1/sqrt(count) — softer than full inverse.
+  # method "inv" uses w ~ 1/count — strict balancing.
+  use_class_balanced_sampler: false
+  class_balance_method: sqrt

@@ -31,7 +31,13 @@ from models.cnn_lstm import CNNLSTM
 from models.cnn_transformer import CNNTransformer
 from models.tsm import TSM
 from models.two_stream_transformer import TwoStreamTransformer
-from utils import build_transforms, set_seed, split_train_val
+from utils import (
+    build_transforms,
+    compute_sample_weights,
+    set_seed,
+    split_train_val,
+)
+from torch.utils.data import WeightedRandomSampler
 
 # Track B (open world) models — lazy imports inside build_model so Track A users
 # don't need to install the extra transformers/huggingface dependency.
@@ -249,6 +255,14 @@ def main(cfg: DictConfig) -> None:
         random_erasing_ratio=tuple(
             cfg.training.get("random_erasing_ratio", (0.3, 3.3))
         ),
+        use_rotation=bool(cfg.training.get("use_rotation", False)),
+        rotation_degrees=float(cfg.training.get("rotation_degrees", 5.0)),
+        use_sharpness=bool(cfg.training.get("use_sharpness", False)),
+        sharpness_strength=float(cfg.training.get("sharpness_strength", 0.5)),
+        use_blur=bool(cfg.training.get("use_blur", False)),
+        blur_p=float(cfg.training.get("blur_p", 0.2)),
+        blur_kernel=int(cfg.training.get("blur_kernel", 5)),
+        blur_sigma=tuple(cfg.training.get("blur_sigma", (0.1, 1.5))),
     )
     eval_transform = build_transforms(
         is_training=False, use_imagenet_norm=use_imagenet_norm
@@ -280,12 +294,34 @@ def main(cfg: DictConfig) -> None:
             cfg.training.get("prefetch_factor", 4)
         )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=True,
-        **loader_kwargs,
+    use_balanced_sampler = bool(
+        cfg.training.get("use_class_balanced_sampler", False)
     )
+    if use_balanced_sampler:
+        balance_method = str(cfg.training.get("class_balance_method", "sqrt"))
+        sample_weights = compute_sample_weights(train_samples, method=balance_method)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_samples),
+            replacement=True,
+        )
+        print(
+            f"Class-balanced sampler enabled (method={balance_method!r}, "
+            f"{len(train_samples)} samples/epoch with oversampling of rare classes)."
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(cfg.training.batch_size),
+            sampler=sampler,
+            **loader_kwargs,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(cfg.training.batch_size),
+            shuffle=True,
+            **loader_kwargs,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(cfg.training.batch_size),

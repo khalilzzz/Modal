@@ -87,6 +87,14 @@ class _TrainClipTransform:
         random_erasing_p: float,
         random_erasing_scale: Tuple[float, float],
         random_erasing_ratio: Tuple[float, float],
+        use_rotation: bool,
+        rotation_degrees: float,
+        use_sharpness: bool,
+        sharpness_strength: float,
+        use_blur: bool,
+        blur_p: float,
+        blur_kernel: int,
+        blur_sigma: Tuple[float, float],
     ) -> None:
         self.image_size = image_size
         self.use_horizontal_flip = use_horizontal_flip
@@ -99,6 +107,14 @@ class _TrainClipTransform:
         self.random_erasing_p = float(random_erasing_p)
         self.random_erasing_scale = tuple(random_erasing_scale)
         self.random_erasing_ratio = tuple(random_erasing_ratio)
+        self.use_rotation = use_rotation
+        self.rotation_degrees = float(rotation_degrees)
+        self.use_sharpness = use_sharpness
+        self.sharpness_strength = float(sharpness_strength)
+        self.use_blur = use_blur
+        self.blur_p = float(blur_p)
+        self.blur_kernel = int(blur_kernel) if int(blur_kernel) % 2 == 1 else int(blur_kernel) + 1
+        self.blur_sigma = tuple(blur_sigma)
 
         self.normalize = _make_normalize(use_imagenet_norm)
 
@@ -126,6 +142,15 @@ class _TrainClipTransform:
             w_px, h_px = first.size  # PIL: (W, H)
             h, w = h_px, w_px
 
+        if self.use_rotation and self.rotation_degrees > 0:
+            angle = float(
+                torch.empty(()).uniform_(
+                    -self.rotation_degrees, self.rotation_degrees
+                ).item()
+            )
+        else:
+            angle = 0.0
+
         do_flip = self.use_horizontal_flip and (torch.rand(()).item() < 0.5)
 
         if self._color_jitter is not None:
@@ -139,6 +164,24 @@ class _TrainClipTransform:
             fn_idx = ()
             b_f = c_f = s_f = h_f = None
 
+        if self.use_sharpness and self.sharpness_strength > 0:
+            sharpness_factor = float(
+                torch.empty(()).uniform_(
+                    max(0.0, 1.0 - self.sharpness_strength),
+                    1.0 + self.sharpness_strength,
+                ).item()
+            )
+        else:
+            sharpness_factor = 1.0
+
+        do_blur = self.use_blur and (torch.rand(()).item() < self.blur_p)
+        if do_blur:
+            blur_sigma = float(
+                torch.empty(()).uniform_(self.blur_sigma[0], self.blur_sigma[1]).item()
+            )
+        else:
+            blur_sigma = 0.0
+
         # ---- Apply per frame with the SHARED params ----
         out: List[torch.Tensor] = []
         for img in frames:
@@ -146,6 +189,9 @@ class _TrainClipTransform:
                 img = TF.resized_crop(img, i, j, h, w, [size, size])
             else:
                 img = TF.resize(img, [size, size])
+
+            if self.use_rotation and abs(angle) > 1e-3:
+                img = TF.rotate(img, angle, fill=0)
 
             if do_flip:
                 img = TF.hflip(img)
@@ -161,6 +207,16 @@ class _TrainClipTransform:
                         img = TF.adjust_saturation(img, s_f)
                     elif fn_id_int == 3 and h_f is not None:
                         img = TF.adjust_hue(img, h_f)
+
+            if self.use_sharpness and abs(sharpness_factor - 1.0) > 1e-3:
+                img = TF.adjust_sharpness(img, sharpness_factor)
+
+            if do_blur:
+                img = TF.gaussian_blur(
+                    img,
+                    kernel_size=[self.blur_kernel, self.blur_kernel],
+                    sigma=[blur_sigma, blur_sigma],
+                )
 
             tensor = TF.to_tensor(img)
             tensor = self.normalize(tensor)
@@ -216,6 +272,14 @@ def build_transforms(
     random_erasing_p: float = 0.25,
     random_erasing_scale: Tuple[float, float] = (0.02, 0.2),
     random_erasing_ratio: Tuple[float, float] = (0.3, 3.3),
+    use_rotation: bool = False,
+    rotation_degrees: float = 5.0,
+    use_sharpness: bool = False,
+    sharpness_strength: float = 0.5,
+    use_blur: bool = False,
+    blur_p: float = 0.2,
+    blur_kernel: int = 5,
+    blur_sigma: Tuple[float, float] = (0.1, 1.5),
 ) -> ClipTransform:
     """Build a clip-level augmentation pipeline.
 
@@ -237,6 +301,14 @@ def build_transforms(
             random_erasing_p=random_erasing_p,
             random_erasing_scale=random_erasing_scale,
             random_erasing_ratio=random_erasing_ratio,
+            use_rotation=use_rotation,
+            rotation_degrees=rotation_degrees,
+            use_sharpness=use_sharpness,
+            sharpness_strength=sharpness_strength,
+            use_blur=use_blur,
+            blur_p=blur_p,
+            blur_kernel=blur_kernel,
+            blur_sigma=blur_sigma,
         )
     return _EvalClipTransform(
         image_size=image_size, use_imagenet_norm=use_imagenet_norm
@@ -266,6 +338,39 @@ def accuracy_topk(
     for k in topk:
         accuracies.append(correct[:k].reshape(-1).float().sum() / batch_size)
     return tuple(accuracies)
+
+
+def compute_sample_weights(
+    samples: List[Tuple[Path, int]],
+    method: str = "sqrt",
+) -> List[float]:
+    """Per-sample weights for ``WeightedRandomSampler`` based on class frequency.
+
+    method:
+        "inv"  -> weight = 1 / count(class)   (full inverse frequency)
+        "sqrt" -> weight = 1 / sqrt(count)    (softer; recommended default)
+        "none" -> weight = 1 for all samples  (no rebalancing)
+    """
+    if method not in {"inv", "sqrt", "none"}:
+        raise ValueError(f"Unknown class_balance_method: {method!r}")
+
+    counts: dict[int, int] = {}
+    for _path, label in samples:
+        counts[label] = counts.get(label, 0) + 1
+
+    if method == "none":
+        return [1.0] * len(samples)
+
+    import math as _math
+
+    per_class: dict[int, float] = {}
+    for c, n in counts.items():
+        if method == "inv":
+            per_class[c] = 1.0 / float(n)
+        else:  # "sqrt"
+            per_class[c] = 1.0 / _math.sqrt(float(n))
+
+    return [per_class[label] for _path, label in samples]
 
 
 def split_train_val(
