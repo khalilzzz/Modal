@@ -41,3 +41,12 @@ training:
   # method "inv" uses w ~ 1/count — strict balancing.
   use_class_balanced_sampler: false
   class_balance_method: sqrt
+  # Mixup / CutMix: interpolate or paste pairs of clips inside each batch to
+  # fight overfit. When both are on, each batch flips a coin between them
+  # (standard timm policy). mix_prob is the per-batch probability of applying.
+  # Typical α for Mixup is 0.2, for CutMix is 1.0.
+  use_mixup: false
+  mixup_alpha: 0.2
+  use_cutmix: false
+  cutmix_alpha: 1.0
+  mix_prob: 1.0

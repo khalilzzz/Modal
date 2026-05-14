@@ -15,6 +15,7 @@ split; the dedicated ``dataset.val_dir`` is for ``evaluate.py`` only.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -137,6 +138,81 @@ def build_model(cfg: DictConfig) -> nn.Module:
     raise ValueError(f"Unknown model.name: {name}")
 
 
+def _sample_beta_lambda(alpha: float) -> float:
+    """Sample λ ~ Beta(alpha, alpha). Returns 1.0 if alpha <= 0 (mixing disabled)."""
+    if alpha <= 0.0:
+        return 1.0
+    return float(torch.distributions.Beta(alpha, alpha).sample().item())
+
+
+def _rand_cutmix_bbox(H: int, W: int, lam: float) -> Tuple[int, int, int, int]:
+    """Random rectangle (y1, y2, x1, x2) with target area ≈ (1 - lam) * H * W."""
+    cut_ratio = math.sqrt(max(0.0, 1.0 - lam))
+    ch = int(H * cut_ratio)
+    cw = int(W * cut_ratio)
+    cy = int(torch.randint(0, H, (1,)).item())
+    cx = int(torch.randint(0, W, (1,)).item())
+    y1 = max(0, cy - ch // 2)
+    y2 = min(H, cy + ch // 2)
+    x1 = max(0, cx - cw // 2)
+    x2 = min(W, cx + cw // 2)
+    return y1, y2, x1, x2
+
+
+def _apply_mixup_cutmix(
+    video: torch.Tensor,
+    labels: torch.Tensor,
+    use_mixup: bool,
+    use_cutmix: bool,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+    mix_prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Apply Mixup or CutMix to a (B, T, C, H, W) batch of clips.
+
+    Returns (mixed_video, labels_a, labels_b, lambda). If no mixing happens,
+    labels_a == labels_b == labels and lambda == 1.0 (downstream loss reduces
+    to plain CE on labels_a).
+
+    When both flags are on, each batch flips a coin and picks one of the two
+    (standard timm-style policy).
+    """
+    if not (use_mixup or use_cutmix):
+        return video, labels, labels, 1.0
+    if torch.rand(()).item() >= mix_prob:
+        return video, labels, labels, 1.0
+
+    if use_mixup and use_cutmix:
+        mode = "mixup" if torch.rand(()).item() < 0.5 else "cutmix"
+    elif use_mixup:
+        mode = "mixup"
+    else:
+        mode = "cutmix"
+
+    B = video.size(0)
+    perm = torch.randperm(B, device=video.device)
+    labels_b = labels[perm]
+
+    if mode == "mixup":
+        lam = _sample_beta_lambda(mixup_alpha)
+        # Linear interpolation in pixel space (post-normalization). Identical
+        # crop/flip/etc was already applied per-clip, so no temporal break.
+        video = lam * video + (1.0 - lam) * video[perm]
+    else:  # cutmix
+        lam = _sample_beta_lambda(cutmix_alpha)
+        _, _, _, H, W = video.shape
+        y1, y2, x1, x2 = _rand_cutmix_bbox(H, W, lam)
+        if (y2 - y1) > 0 and (x2 - x1) > 0:
+            # Same rectangle pasted on all T frames of every clip → temporal
+            # consistency preserved.
+            video[:, :, :, y1:y2, x1:x2] = video[perm][:, :, :, y1:y2, x1:x2]
+            # Adjust λ to the actual cut area (handles edge clipping).
+            lam = 1.0 - float((y2 - y1) * (x2 - x1)) / float(H * W)
+        # else: cut had zero area, leave video and lam as-is
+
+    return video, labels, labels_b, lam
+
+
 def train_one_epoch(
     model: nn.Module,
     data_loader: DataLoader,
@@ -145,8 +221,18 @@ def train_one_epoch(
     device: torch.device,
     scaler: GradScaler,
     use_amp: bool,
+    use_mixup: bool = False,
+    mixup_alpha: float = 0.2,
+    use_cutmix: bool = False,
+    cutmix_alpha: float = 1.0,
+    mix_prob: float = 1.0,
 ) -> Tuple[float, float]:
-    """Returns (average loss, top-1 accuracy) on the training set for one epoch."""
+    """Returns (average loss, top-1 accuracy) on the training set for one epoch.
+
+    When use_mixup/use_cutmix are on, training mixes pairs of clips per batch.
+    The reported "accuracy" then counts matches against the primary label
+    (labels_a) — it under-reports a bit but stays consistent for monitoring.
+    """
     model.train()
     running_loss = 0.0
     correct = 0
@@ -157,17 +243,33 @@ def train_one_epoch(
         video_batch = video_batch.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        video_batch, labels_a, labels_b, lam = _apply_mixup_cutmix(
+            video_batch,
+            labels,
+            use_mixup=use_mixup,
+            use_cutmix=use_cutmix,
+            mixup_alpha=mixup_alpha,
+            cutmix_alpha=cutmix_alpha,
+            mix_prob=mix_prob,
+        )
+
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device.type, enabled=use_amp):
             logits = model(video_batch)  # (B, num_classes)
-            loss = loss_fn(logits, labels)
+            if lam < 1.0:
+                loss = lam * loss_fn(logits, labels_a) + (1.0 - lam) * loss_fn(
+                    logits, labels_b
+                )
+            else:
+                loss = loss_fn(logits, labels_a)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
-        correct += int((predictions == labels).sum().item())
+        # Match against the primary (un-permuted) label — biased but consistent.
+        correct += int((predictions == labels_a).sum().item())
         total += labels.size(0)
 
     average_loss = running_loss / max(total, 1)
@@ -377,9 +479,28 @@ def main(cfg: DictConfig) -> None:
     scaler = GradScaler(device.type, enabled=use_amp)
     print(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
 
+    mixup_kwargs: Dict[str, Any] = {
+        "use_mixup": bool(cfg.training.get("use_mixup", False)),
+        "mixup_alpha": float(cfg.training.get("mixup_alpha", 0.2)),
+        "use_cutmix": bool(cfg.training.get("use_cutmix", False)),
+        "cutmix_alpha": float(cfg.training.get("cutmix_alpha", 1.0)),
+        "mix_prob": float(cfg.training.get("mix_prob", 1.0)),
+    }
+    if mixup_kwargs["use_mixup"] or mixup_kwargs["use_cutmix"]:
+        modes = []
+        if mixup_kwargs["use_mixup"]:
+            modes.append(f"Mixup(α={mixup_kwargs['mixup_alpha']})")
+        if mixup_kwargs["use_cutmix"]:
+            modes.append(f"CutMix(α={mixup_kwargs['cutmix_alpha']})")
+        print(
+            f"Batch mixing enabled: {' + '.join(modes)} "
+            f"(applied with p={mixup_kwargs['mix_prob']})"
+        )
+
     for epoch in range(int(cfg.training.epochs)):
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, loss_fn, optimizer, device, scaler, use_amp
+            model, train_loader, loss_fn, optimizer, device, scaler, use_amp,
+            **mixup_kwargs,
         )
         val_loss, val_acc = evaluate_epoch(
             model, val_loader, loss_fn, device, use_amp
