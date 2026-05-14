@@ -1,0 +1,28 @@
+# @package _global_
+# TSM — Track A (from scratch). Optimized for a small Something-Something subset.
+defaults:
+  - override /model: tsm
+
+dataset:
+  num_frames: 10         # must match model.num_segments
+
+training:
+  epochs: 10
+  batch_size: 32        # 24 * 8 = 192 frames/step; reduce to 16 if VRAM-limited
+  lr: 0.01              # SGD-style; TSM canonical recipe
+  optimizer: sgd        # see note below — add an "sgd" branch in train.py
+  weight_decay: 0.0005
+  momentum: 0.9
+
+  use_amp: true
+
+  # Augmentation — CRITICAL for Something-Something
+  use_horizontal_flip: false    # MUST be off — SS has directional classes
+  use_random_crop: true
+  random_crop_scale: [0.6, 1.0]
+  use_color_jitter: true
+  color_jitter_strength: 0.2
+
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4

@@ -1,0 +1,17 @@
+# @package _global_
+# TSM (Temporal Shift Module) — Track A (from scratch).
+# Reference: Lin et al., "TSM: Temporal Shift Module for Efficient Video
+# Understanding" (ICCV 2019). 2D ResNet18 + per-block channel shift along time.
+model:
+  name: tsm
+  pretrained: false
+  num_classes: ${num_classes}
+  # Number of frames per clip. MUST equal dataset.num_frames (asserted at forward).
+  num_segments: 8
+  # ResNet18 base channels (final feature dim = base_channels * 8 = 512 by default).
+  base_channels: 64
+  # Dropout applied just before the classifier.
+  dropout: 0.5
+  # 1/fold_div of channels get shifted forward, another 1/fold_div backward.
+  # Default fold_div=8 means 12.5% shift forward + 12.5% backward = 25% touched.
+  fold_div: 8

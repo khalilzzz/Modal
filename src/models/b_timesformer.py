@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class TimeSformerClassifier(nn.Module):
@@ -40,12 +41,35 @@ class TimeSformerClassifier(nn.Module):
         from transformers import TimesformerConfig, TimesformerForVideoClassification
 
         if pretrained:
+            # Load with the model's native num_frames (no override) so the
+            # pretrained time_embeddings (shape (1, native_frames, hidden)) are
+            # loaded intact. We then interpolate them to our num_frames below.
             self.model = TimesformerForVideoClassification.from_pretrained(
                 model_id,
                 num_labels=int(num_classes),
-                num_frames=int(num_frames),
                 ignore_mismatched_sizes=True,
             )
+
+            native_frames = int(self.model.config.num_frames)
+            target_frames = int(num_frames)
+            if target_frames != native_frames:
+                # Linearly interpolate the learned temporal embeddings from
+                # native_frames positions down to target_frames positions.
+                # Without this, HF reinits them randomly and the temporal
+                # attention is effectively destroyed — training stalls near
+                # uniform predictions at our base LR.
+                old = self.model.timesformer.embeddings.time_embeddings.data
+                # (1, native_frames, hidden) -> (1, hidden, native_frames)
+                resized = F.interpolate(
+                    old.transpose(1, 2),
+                    size=target_frames,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+                self.model.timesformer.embeddings.time_embeddings = nn.Parameter(
+                    resized.contiguous()
+                )
+                self.model.config.num_frames = target_frames
         else:
             config = TimesformerConfig(
                 num_labels=int(num_classes), num_frames=int(num_frames)

@@ -12,7 +12,8 @@ dependencies = [
     "omegaconf>=2.3.0",
     "pillow>=10.0.0",
     # Track B (open world): HuggingFace transformers for pretrained video models
-    # (VideoMAE, TimeSformer). Used by models whose name starts with ``a_``.
+    # (VideoMAE, TimeSformer). Lazy-imported in src/train.py, so Track A code
+    # never touches it at runtime — but installed unconditionally for simplicity.
     "transformers>=4.40.0",
 ]
 

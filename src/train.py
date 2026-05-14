@@ -29,6 +29,7 @@ from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
 from models.cnn_transformer import CNNTransformer
+from models.tsm import TSM
 from models.two_stream_transformer import TwoStreamTransformer
 from utils import build_transforms, set_seed, split_train_val
 
@@ -71,6 +72,16 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_layers=int(cfg.model.get("num_layers", 4)),
             dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
             dropout=float(cfg.model.get("dropout", 0.2)),
+        )
+    if name == "tsm":
+        # TSM requires num_segments == dataset.num_frames (asserted in forward).
+        return TSM(
+            num_classes=num_classes,
+            num_segments=int(cfg.model.get("num_segments", cfg.dataset.num_frames)),
+            pretrained=pretrained,
+            base_channels=int(cfg.model.get("base_channels", 64)),
+            dropout=float(cfg.model.get("dropout", 0.5)),
+            fold_div=int(cfg.model.get("fold_div", 8)),
         )
 
     # Track B (open world) models. Prefixed with "b_" by convention.
@@ -280,10 +291,23 @@ def main(cfg: DictConfig) -> None:
         optimizer = torch.optim.Adam(
             model.parameters(), lr=lr, weight_decay=weight_decay
         )
+    elif optimizer_name == "sgd":
+        momentum = float(cfg.training.get("momentum", 0.9))
+        nesterov = bool(cfg.training.get("nesterov", False))
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+        )
     else:
         raise ValueError(f"Unknown training.optimizer: {optimizer_name}")
+    extra = ""
+    if optimizer_name == "sgd":
+        extra = f", momentum={cfg.training.get('momentum', 0.9)}"
     print(
-        f"Optimizer: {optimizer_name} (lr={lr}, weight_decay={weight_decay})"
+        f"Optimizer: {optimizer_name} (lr={lr}, weight_decay={weight_decay}{extra})"
     )
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
 
