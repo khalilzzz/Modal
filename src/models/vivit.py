@@ -288,6 +288,11 @@ class ViViT(nn.Module):
         nn.init.trunc_normal_(self.pos_embed_t, std=0.02)
         self.apply(self._init_module)
 
+    @torch.jit.ignore
+    def no_weight_decay(self) -> set[str]:
+        """Named params to exclude from weight decay (ViT convention)."""
+        return {"cls_token_s", "cls_token_t", "pos_embed_s", "pos_embed_t"}
+
     @staticmethod
     def _init_module(m: nn.Module) -> None:
         if isinstance(m, nn.Linear):

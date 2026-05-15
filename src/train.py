@@ -63,14 +63,15 @@ def build_model(cfg: DictConfig) -> nn.Module:
         return CNNTransformer(
             num_classes=num_classes,
             pretrained=pretrained,
-            num_heads=int(cfg.model.get("num_heads", 8)),
-            num_layers=int(cfg.model.get("num_layers", 2)),
-            dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
-            dropout=float(cfg.model.get("dropout", 0.1)),
             num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
-            use_spatial_tokens=bool(cfg.model.get("use_spatial_tokens", True)),
-            causal=bool(cfg.model.get("causal", False)),
-            pool=str(cfg.model.get("pool", "cls")),
+            spatial_tokens_side=int(cfg.model.get("spatial_tokens_side", 1)),
+            d_model=int(cfg.model.get("d_model", 512)),
+            num_layers=int(cfg.model.get("num_layers", 4)),
+            num_heads=int(cfg.model.get("num_heads", 8)),
+            mlp_ratio=float(cfg.model.get("mlp_ratio", 2.0)),
+            dropout=float(cfg.model.get("dropout", 0.1)),
+            attn_dropout=float(cfg.model.get("attn_dropout", 0.0)),
+            drop_path=float(cfg.model.get("drop_path", 0.1)),
         )
     if name == "two_stream_transformer":
         return TwoStreamTransformer(
@@ -490,6 +491,32 @@ def main(cfg: DictConfig) -> None:
         print(
             f"Layer-wise LR decay: rate={llrd_rate}, {len(param_groups)} groups, "
             f"LR range [{lrs[0]:.2e}, {lrs[-1]:.2e}]"
+        )
+    elif hasattr(model, "no_weight_decay") and weight_decay > 0:
+        # ViT convention: exclude CLS tokens, position embeddings, biases and
+        # LayerNorm params from weight decay. The model declares which named
+        # params via no_weight_decay(); 1-D params (biases / norm gammas) are
+        # caught automatically.
+        no_decay_names = set(model.no_weight_decay())
+        decay_params, no_decay_params = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_no_decay = (
+                name in no_decay_names
+                or param.ndim <= 1
+                or name.endswith(".bias")
+            )
+            (no_decay_params if is_no_decay else decay_params).append(param)
+        param_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        print(
+            f"Weight decay split: {sum(p.numel() for p in decay_params):,} "
+            f"params w/ wd={weight_decay}, "
+            f"{sum(p.numel() for p in no_decay_params):,} params w/o "
+            f"(named: {sorted(no_decay_names)})"
         )
     else:
         param_groups = model.parameters()
