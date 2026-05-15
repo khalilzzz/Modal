@@ -11,6 +11,11 @@ training:
   # Optimizer: "adam", "adamw", or "sgd". AdamW applies decoupled weight decay.
   optimizer: adam
   weight_decay: 0.0
+  # Mixed precision (AMP): much faster on GPU, ~half the VRAM. CUDA only.
+  use_amp: true
+  # DataLoader knobs (active when num_workers > 0).
+  persistent_workers: false
+  prefetch_factor: 4
   # Layer-wise LR decay (ViT fine-tuning standard): head gets `lr`, each
   # transformer block earlier gets `lr * llrd_rate^(depth_to_head)`. Only
   # supported by models with a get_param_groups_llrd() method (V-JEPA 2 for
