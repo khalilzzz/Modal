@@ -6,6 +6,10 @@ Loads a V-JEPA 2 SSv2-finetuned checkpoint (default
 challenge's ``num_classes`` (33), and exposes the standard
 ``(B, T, C, H, W) -> (B, num_classes)`` interface used everywhere in this repo.
 
+Also exposes ``get_param_groups_llrd`` for layer-wise LR decay: head gets full
+LR, each transformer block earlier in the network gets ``base_lr × decay^d``
+where ``d`` is the depth-to-head. Standard for ViT fine-tuning (DeiT, BEiT, MAE).
+
 Why V-JEPA 2:
     Meta's V-JEPA 2 (2025) is the current public state-of-the-art on
     Something-Something V2. The pretraining is self-supervised on a very large
@@ -32,6 +36,8 @@ correct for V-JEPA 2 checkpoints.
 from __future__ import annotations
 
 import inspect
+import re
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -101,6 +107,76 @@ class VJEPA2Classifier(nn.Module):
             for name, param in self.model.named_parameters():
                 if not name.startswith("classifier"):
                     param.requires_grad = False
+
+    def _count_encoder_layers(self) -> int:
+        """Count transformer blocks by inspecting parameter names."""
+        layer_nums = set()
+        for name, _ in self.model.named_parameters():
+            m = re.search(r"\.layer\.(\d+)\.", name) or re.search(
+                r"\.layers\.(\d+)\.", name
+            )
+            if m:
+                layer_nums.add(int(m.group(1)))
+        return max(layer_nums) + 1 if layer_nums else 24  # ViT-L default
+
+    def get_param_groups_llrd(
+        self,
+        base_lr: float,
+        weight_decay: float,
+        decay_rate: float = 0.65,
+    ) -> List[Dict[str, Any]]:
+        """Layer-wise LR decay param groups.
+
+        Head gets ``base_lr``. Encoder block i gets ``base_lr × decay^(N - i)``
+        where N is the deepest block. Embeddings get the smallest LR. Biases /
+        norm / position-embed params get weight_decay=0 (ViT standard).
+        """
+        num_layers = self._count_encoder_layers()
+        max_depth = num_layers + 1  # head sits one step beyond the last block
+
+        def layer_id(name: str) -> int:
+            # Higher id = closer to head = larger LR.
+            if "classifier" in name or "pooler" in name:
+                return max_depth
+            m = re.search(r"\.layer\.(\d+)\.", name) or re.search(
+                r"\.layers\.(\d+)\.", name
+            )
+            if m:
+                return int(m.group(1)) + 1
+            # Final norm of the encoder, treat as the last block.
+            if "encoder.layernorm" in name.lower() or name.endswith(".norm.weight"):
+                return num_layers
+            # Embeddings, patch_embed, pos_embed → deepest depth from head.
+            return 0
+
+        # Group params by (layer_id, decay/nodecay).
+        groups: Dict[tuple, List[nn.Parameter]] = {}
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            lid = layer_id(name)
+            # ViT convention: no weight decay on biases, LayerNorm, pos embeds.
+            no_decay = (
+                param.ndim <= 1
+                or name.endswith(".bias")
+                or "layernorm" in name.lower()
+                or "pos_embed" in name.lower()
+                or "position_embeddings" in name.lower()
+                or "cls_token" in name.lower()
+            )
+            groups.setdefault((lid, no_decay), []).append(param)
+
+        param_groups: List[Dict[str, Any]] = []
+        for (lid, no_decay), params in sorted(groups.items()):
+            multiplier = decay_rate ** (max_depth - lid)
+            param_groups.append(
+                {
+                    "params": params,
+                    "lr": base_lr * multiplier,
+                    "weight_decay": 0.0 if no_decay else weight_decay,
+                }
+            )
+        return param_groups
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         """video: (B, T, C, H, W) -> logits (B, num_classes)."""

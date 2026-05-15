@@ -447,19 +447,42 @@ def main(cfg: DictConfig) -> None:
     optimizer_name = str(cfg.training.get("optimizer", "adam")).lower()
     weight_decay = float(cfg.training.get("weight_decay", 0.0))
     lr = float(cfg.training.lr)
+
+    # Layer-wise LR decay: head gets full LR, earlier transformer blocks get
+    # progressively smaller LRs. Standard for ViT fine-tuning.
+    use_llrd = bool(cfg.training.get("lwlrdecay", False))
+    if use_llrd:
+        if not hasattr(model, "get_param_groups_llrd"):
+            raise ValueError(
+                f"training.lwlrdecay=true but model {cfg.model.name!r} does "
+                "not implement get_param_groups_llrd(). Only V-JEPA 2 supports "
+                "LLRD currently — set training.lwlrdecay=false."
+            )
+        llrd_rate = float(cfg.training.get("llrd_rate", 0.65))
+        param_groups = model.get_param_groups_llrd(
+            base_lr=lr, weight_decay=weight_decay, decay_rate=llrd_rate
+        )
+        lrs = sorted({float(g["lr"]) for g in param_groups})
+        print(
+            f"Layer-wise LR decay: rate={llrd_rate}, {len(param_groups)} groups, "
+            f"LR range [{lrs[0]:.2e}, {lrs[-1]:.2e}]"
+        )
+    else:
+        param_groups = model.parameters()
+
     if optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+            param_groups, lr=lr, weight_decay=weight_decay
         )
     elif optimizer_name == "adam":
         optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+            param_groups, lr=lr, weight_decay=weight_decay
         )
     elif optimizer_name == "sgd":
         momentum = float(cfg.training.get("momentum", 0.9))
         nesterov = bool(cfg.training.get("nesterov", False))
         optimizer = torch.optim.SGD(
-            model.parameters(),
+            param_groups,
             lr=lr,
             momentum=momentum,
             weight_decay=weight_decay,

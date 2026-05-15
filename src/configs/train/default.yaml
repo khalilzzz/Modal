@@ -11,6 +11,12 @@ training:
   # Optimizer: "adam", "adamw", or "sgd". AdamW applies decoupled weight decay.
   optimizer: adam
   weight_decay: 0.0
+  # Layer-wise LR decay (ViT fine-tuning standard): head gets `lr`, each
+  # transformer block earlier gets `lr * llrd_rate^(depth_to_head)`. Only
+  # supported by models with a get_param_groups_llrd() method (V-JEPA 2 for
+  # now). 0.65 is standard for ViT-L, 0.75 for ViT-B.
+  lwlrdecay: false
+  llrd_rate: 0.65
   # Augmentation toggles (applied only during training, never on val/test).
   # The random params below are sampled ONCE per clip and applied identically
   # to every frame — temporal consistency is preserved.
