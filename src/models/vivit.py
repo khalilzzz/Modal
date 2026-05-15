@@ -70,11 +70,15 @@ class _DropPath(nn.Module):
 class _LayerScale(nn.Module):
     """Per-channel learnable scale on a residual branch (CaiT, Touvron 2021).
 
-    With tiny init (1e-5) the residual branch is near-zero at the start of
-    training, which lets very deep transformers converge from scratch.
+    Init guide:
+        - 10-12 layers (this model): 1.0 — residuals start "fully open"
+        - 24 layers (ViT-Large depth): 0.1
+        - 36+ layers (very deep): 1e-4 to 1e-6
+    Initialising too small on a shallow stack kills the residual signal and
+    the model fails to learn (CLS stays constant through the encoder).
     """
 
-    def __init__(self, dim: int, init_value: float = 1e-5) -> None:
+    def __init__(self, dim: int, init_value: float = 1.0) -> None:
         super().__init__()
         self.gamma = nn.Parameter(init_value * torch.ones(dim))
 
@@ -193,7 +197,7 @@ class ViViT(nn.Module):
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         drop_path_rate: float = 0.1,
-        layer_scale_init: float = 1e-5,
+        layer_scale_init: float = 1.0,
         pretrained: bool = False,  # accepted for API compatibility — Track A
     ) -> None:
         super().__init__()

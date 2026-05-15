@@ -112,7 +112,7 @@ def build_model(cfg: DictConfig) -> nn.Module:
             dropout=float(cfg.model.get("dropout", 0.0)),
             attn_dropout=float(cfg.model.get("attn_dropout", 0.0)),
             drop_path_rate=float(cfg.model.get("drop_path_rate", 0.1)),
-            layer_scale_init=float(cfg.model.get("layer_scale_init", 1e-5)),
+            layer_scale_init=float(cfg.model.get("layer_scale_init", 1.0)),
         )
 
     # Track B (open world) models. Prefixed with "b_" by convention.

@@ -17,4 +17,4 @@ model:
   dropout: 0.0
   attn_dropout: 0.0
   drop_path_rate: 0.1       # stochastic depth, linearly scaled through depth
-  layer_scale_init: 1.0e-5  # tiny init so residuals start near zero
+  layer_scale_init: 1.0     # 1.0 for ~10-layer stacks; drop to 0.1 if you go to 24+
