@@ -175,7 +175,17 @@ def main(cfg: DictConfig) -> None:
 
     # Normalization must match how the checkpoint was trained (ImageNet stats if pretrained).
     pretrained_used = bool(raw.get("pretrained", cfg.model.pretrained))
-    eval_transform = build_transforms(is_training=False, use_imagenet_norm=pretrained_used)
+    # Use the same image_size as training: stored in the checkpoint's config,
+    # falling back to the current cfg / 224.
+    ckpt_cfg = OmegaConf.create(raw["config"]) if "config" in raw else cfg
+    image_size = int(
+        ckpt_cfg.dataset.get("image_size", cfg.dataset.get("image_size", 224))
+    )
+    eval_transform = build_transforms(
+        image_size=image_size,
+        is_training=False,
+        use_imagenet_norm=pretrained_used,
+    )
 
     val_dir = Path(cfg.dataset.val_dir).resolve()
     val_samples = collect_video_samples(val_dir)

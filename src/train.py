@@ -94,6 +94,26 @@ def build_model(cfg: DictConfig) -> nn.Module:
             dropout=float(cfg.model.get("dropout", 0.5)),
             fold_div=int(cfg.model.get("fold_div", 8)),
         )
+    if name == "vivit":
+        from models.vivit import ViViT
+
+        return ViViT(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
+            image_size=int(cfg.model.get("image_size", 224)),
+            patch_size=int(cfg.model.get("patch_size", 16)),
+            tubelet_size=int(cfg.model.get("tubelet_size", 2)),
+            embed_dim=int(cfg.model.get("embed_dim", 256)),
+            spatial_depth=int(cfg.model.get("spatial_depth", 6)),
+            temporal_depth=int(cfg.model.get("temporal_depth", 4)),
+            num_heads=int(cfg.model.get("num_heads", 8)),
+            mlp_ratio=float(cfg.model.get("mlp_ratio", 4.0)),
+            dropout=float(cfg.model.get("dropout", 0.0)),
+            attn_dropout=float(cfg.model.get("attn_dropout", 0.0)),
+            drop_path_rate=float(cfg.model.get("drop_path_rate", 0.1)),
+            layer_scale_init=float(cfg.model.get("layer_scale_init", 1e-5)),
+        )
 
     # Track B (open world) models. Prefixed with "b_" by convention.
     # Lazy import keeps the transformers dependency optional for Track A.
@@ -340,7 +360,9 @@ def main(cfg: DictConfig) -> None:
 
     # Match normalization to pretrained flag (ImageNet stats when using pretrained weights).
     use_imagenet_norm = bool(cfg.model.pretrained)
+    image_size = int(cfg.dataset.get("image_size", 224))
     train_transform = build_transforms(
+        image_size=image_size,
         is_training=True,
         use_imagenet_norm=use_imagenet_norm,
         use_horizontal_flip=bool(cfg.training.get("use_horizontal_flip", False)),
@@ -367,7 +389,9 @@ def main(cfg: DictConfig) -> None:
         blur_sigma=tuple(cfg.training.get("blur_sigma", (0.1, 1.5))),
     )
     eval_transform = build_transforms(
-        is_training=False, use_imagenet_norm=use_imagenet_norm
+        image_size=image_size,
+        is_training=False,
+        use_imagenet_norm=use_imagenet_norm,
     )
 
     train_dataset = VideoFrameDataset(
