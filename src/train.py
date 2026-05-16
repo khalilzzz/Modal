@@ -154,6 +154,28 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
             image_size=int(cfg.model.get("image_size", 256)),
             freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
+            use_gradient_checkpointing=bool(
+                cfg.model.get("use_gradient_checkpointing", False)
+            ),
+        )
+    if name == "b_vjepa2_1b":
+        # ViT-g (1B) variant. Same wrapper, heavier defaults: 64-frame /
+        # 384×384 native inputs, gradient checkpointing on by default to keep
+        # VRAM survivable on a 24 GB GPU.
+        from models.b_vjepa2 import VJEPA2Classifier
+
+        return VJEPA2Classifier(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            model_id=str(
+                cfg.model.get("model_id", "facebook/vjepa2-vitg-fpc64-384-ssv2")
+            ),
+            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
+            image_size=int(cfg.model.get("image_size", 384)),
+            freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
+            use_gradient_checkpointing=bool(
+                cfg.model.get("use_gradient_checkpointing", True)
+            ),
         )
 
     raise ValueError(f"Unknown model.name: {name}")

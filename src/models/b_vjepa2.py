@@ -53,6 +53,7 @@ class VJEPA2Classifier(nn.Module):
         num_frames: int = 4,
         image_size: int = 256,
         freeze_backbone: bool = False,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
@@ -107,6 +108,21 @@ class VJEPA2Classifier(nn.Module):
             for name, param in self.model.named_parameters():
                 if not name.startswith("classifier"):
                     param.requires_grad = False
+
+        # Gradient checkpointing: trades compute for VRAM by re-running the
+        # forward of each transformer block during backward instead of caching
+        # activations. Essential for the ViT-g (1B) variant at 64×384² inputs.
+        # `use_reentrant=False` is the future-proof path (the True default is
+        # deprecated and breaks under torch.compile / DDP find_unused_params).
+        if use_gradient_checkpointing:
+            try:
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                self.model.gradient_checkpointing_enable()
+            except AttributeError:
+                pass
 
     def _count_encoder_layers(self) -> int:
         """Count transformer blocks by inspecting parameter names."""
@@ -200,3 +216,85 @@ class VJEPA2Classifier(nn.Module):
 
         outputs = self.model(**{self._video_kwarg: video})
         return outputs.logits
+
+
+class VJEPA2ZeroShotClassifier(nn.Module):
+    """V-JEPA 2 used **zero-shot**: the original SSv2 (174-class) head is kept
+    intact, and the model's logits are sliced down to the challenge's subset
+    via a pre-computed index mapping. No training needed.
+
+    The mapping is provided by the caller — usually built by matching
+    challenge class folder names against ``hf_model.config.id2label``.
+
+    Frame-replication and spatial-resize mechanics mirror ``VJEPA2Classifier``
+    so the model still consumes the project's standard ``(B, T, C, H, W)``
+    layout with ``T == dataset.num_frames``.
+    """
+
+    def __init__(
+        self,
+        class_indices: List[int],
+        model_id: str = "facebook/vjepa2-vitg-fpc64-384-ssv2",
+        num_frames: int = 4,
+        image_size: int = 384,
+    ) -> None:
+        super().__init__()
+
+        try:
+            from transformers import AutoModelForVideoClassification
+        except ImportError as e:
+            raise ImportError(
+                "V-JEPA 2 requires a recent `transformers` (>= 4.55). "
+                "Run `uv sync` or `uv pip install -U transformers`."
+            ) from e
+
+        # IMPORTANT: no `num_labels` / `ignore_mismatched_sizes` override here.
+        # We need the original SSv2 head intact so the pretrained logits stay
+        # meaningful — that's the whole point of zero-shot.
+        self.model = AutoModelForVideoClassification.from_pretrained(model_id)
+
+        self.register_buffer(
+            "ssv2_indices", torch.tensor(class_indices, dtype=torch.long)
+        )
+
+        cfg = self.model.config
+        native_frames = int(
+            getattr(cfg, "frames_per_clip", getattr(cfg, "num_frames", 16))
+        )
+        if native_frames % int(num_frames) != 0:
+            raise ValueError(
+                f"V-JEPA 2 native num_frames={native_frames} is not a multiple "
+                f"of dataset num_frames={num_frames}."
+            )
+        self.native_frames = native_frames
+        self.target_frames = int(num_frames)
+        self._repeat = self.native_frames // self.target_frames
+        self.image_size = int(image_size)
+
+        params = inspect.signature(self.model.forward).parameters
+        self._video_kwarg = (
+            "pixel_values_videos" if "pixel_values_videos" in params else "pixel_values"
+        )
+
+    @torch.no_grad()
+    def forward(self, video: torch.Tensor) -> torch.Tensor:
+        """video: (B, T, C, H, W) -> logits sliced to the 33-class subset."""
+        B, T, C, H, W = video.shape
+
+        if T != self.native_frames:
+            video = video.repeat_interleave(self._repeat, dim=1)
+
+        if H != self.image_size or W != self.image_size:
+            _, T2, C2, _, _ = video.shape
+            flat = video.reshape(B * T2, C2, H, W)
+            flat = F.interpolate(
+                flat,
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            video = flat.reshape(B, T2, C2, self.image_size, self.image_size)
+
+        outputs = self.model(**{self._video_kwarg: video})
+        # Keep only the challenge's 33 columns from the native 174-class logits.
+        return outputs.logits[:, self.ssv2_indices]
