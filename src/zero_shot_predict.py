@@ -252,8 +252,8 @@ def main(cfg: DictConfig) -> None:
     n_batches = len(loader)
     log_interval = max(1, n_batches // 10)
     with torch.no_grad():
-        for batch_idx, (video_batch, _labels) in enumerate(loader, start=1):
-            video_batch = video_batch.to(device)
+        for batch_idx, batch in enumerate(loader, start=1):
+            video_batch = batch[0].to(device)
             logits = model(video_batch)
             preds.extend(int(p) for p in logits.argmax(dim=1).cpu().tolist())
             if batch_idx % log_interval == 0 or batch_idx == n_batches:
