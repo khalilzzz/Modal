@@ -53,11 +53,14 @@ def build_model(cfg: DictConfig) -> nn.Module:
     if name == "cnn_baseline":
         return CNNBaseline(num_classes=num_classes, pretrained=pretrained)
     if name == "cnn_lstm":
-        hidden = cfg.model.get("lstm_hidden_size", 512)
         return CNNLSTM(
             num_classes=num_classes,
             pretrained=pretrained,
-            lstm_hidden_size=int(hidden),
+            lstm_hidden_size=int(cfg.model.get("lstm_hidden_size", 256)),
+            lstm_num_layers=int(cfg.model.get("lstm_num_layers", 2)),
+            lstm_dropout=float(cfg.model.get("lstm_dropout", 0.3)),
+            feature_dropout=float(cfg.model.get("feature_dropout", 0.2)),
+            head_dropout=float(cfg.model.get("head_dropout", 0.5)),
         )
     if name == "cnn_transformer":
         return CNNTransformer(
