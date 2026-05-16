@@ -99,19 +99,32 @@ def _read_challenge_classes(train_dir: Path) -> Dict[int, Tuple[str, str]]:
 def _build_class_mapping(
     challenge_classes: Dict[int, Tuple[str, str]],
     ssv2_id2label: Dict[int, str],
+    allow_missing: bool = False,
+    missing_fallback_ssv2_idx: int = 0,
 ) -> List[int]:
     """Build a list ``mapping[challenge_idx] = ssv2_idx`` covering 0..N-1.
 
-    Matching is done on the normalized name. Raises with a useful diagnostic
-    if any challenge class can't be matched.
+    Matching strategy (per challenge class):
+      1. Exact match on the normalized name.
+      2. **Prefix match**: if the challenge name is a prefix of exactly one
+         SSv2 label, use that. Handles cases where the challenge folder name
+         was truncated by the dataset packager (a real failure mode here —
+         e.g. ``015_Pretending_to_pour_something_out_of_something_but_something_``).
+      3. Otherwise: collected into ``missing``.
+
+    If ``allow_missing`` is True, unmatched classes are mapped to
+    ``missing_fallback_ssv2_idx`` (default 0) and a warning is printed.
+    Otherwise raises a useful diagnostic.
     """
-    ssv2_norm_to_idx: Dict[str, int] = {}
-    for idx, label in ssv2_id2label.items():
-        ssv2_norm_to_idx[_normalize_name(label)] = int(idx)
+    ssv2_pairs: List[Tuple[int, str]] = [
+        (int(idx), _normalize_name(label)) for idx, label in ssv2_id2label.items()
+    ]
+    ssv2_exact: Dict[str, int] = {norm: idx for idx, norm in ssv2_pairs}
 
     num_classes = max(challenge_classes.keys()) + 1
     mapping: List[int] = [-1] * num_classes
     missing: List[Tuple[int, str]] = []
+    prefix_resolved: List[Tuple[int, str, int, str]] = []  # ch_idx, ch_raw, s_idx, s_raw
 
     for idx in range(num_classes):
         info = challenge_classes.get(idx)
@@ -119,18 +132,56 @@ def _build_class_mapping(
             missing.append((idx, "<no folder for this index>"))
             continue
         raw_name, norm_name = info
-        ssv2_idx = ssv2_norm_to_idx.get(norm_name)
-        if ssv2_idx is None:
-            missing.append((idx, raw_name))
+
+        # 1) Exact match
+        s_idx = ssv2_exact.get(norm_name)
+        if s_idx is not None:
+            mapping[idx] = s_idx
+            continue
+
+        # 2) Prefix match (challenge name is a prefix of an SSv2 label)
+        candidates = [
+            (i, n) for i, n in ssv2_pairs
+            if n.startswith(norm_name)
+        ]
+        if len(candidates) == 1:
+            s_idx, _ = candidates[0]
+            mapping[idx] = s_idx
+            prefix_resolved.append((idx, raw_name, s_idx, ssv2_id2label[s_idx]))
+            continue
+
+        if len(candidates) > 1:
+            # Show up to 3 ambiguous candidates in the error
+            sample = ", ".join(
+                f"[{i}] {ssv2_id2label[i]!r}" for i, _ in candidates[:3]
+            )
+            extra = f" (+{len(candidates)-3} more)" if len(candidates) > 3 else ""
+            missing.append(
+                (idx, f"{raw_name} (ambiguous prefix; matches: {sample}{extra})")
+            )
         else:
-            mapping[idx] = ssv2_idx
+            missing.append((idx, raw_name))
+
+    if prefix_resolved:
+        print(f"Resolved {len(prefix_resolved)} class(es) via prefix match "
+              f"(challenge name was a prefix of the SSv2 label):", flush=True)
+        for ch_idx, ch_raw, s_idx, s_raw in prefix_resolved:
+            print(f"  challenge[{ch_idx}] {ch_raw!r}", flush=True)
+            print(f"     -> SSv2[{s_idx}] {s_raw!r}", flush=True)
 
     if missing:
         details = "\n".join(
-            f"  challenge[{i}] = {n!r}  (normalized: {_normalize_name(n)!r})"
-            for i, n in missing[:15]
+            f"  challenge[{i}] = {n!r}" for i, n in missing[:15]
         )
-        # Show a few SSv2 labels to help the user spot the mismatch.
+        if allow_missing:
+            print(f"WARNING: {len(missing)} class(es) unresolved, mapped to "
+                  f"SSv2 index {missing_fallback_ssv2_idx} as a fallback:\n"
+                  f"{details}", flush=True)
+            for ch_idx, _ in missing:
+                if mapping[ch_idx] == -1:
+                    mapping[ch_idx] = missing_fallback_ssv2_idx
+            return mapping
+
         sample_ssv2 = "\n".join(
             f"  ssv2[{i}] = {l!r}"
             for i, l in list(ssv2_id2label.items())[:10]
@@ -139,9 +190,14 @@ def _build_class_mapping(
             f"{len(missing)} challenge class(es) could not be matched to "
             f"SSv2 id2label:\n{details}\n\n"
             f"First few SSv2 labels for comparison:\n{sample_ssv2}\n\n"
-            "If the names look almost identical, tweak `_normalize_name` in "
-            "zero_shot_predict.py — usually it's a punctuation / placeholder "
-            "format mismatch (e.g. '[something]' vs 'something')."
+            "Fixes:\n"
+            "  - If a folder is missing entirely (e.g. challenge[27]), inspect\n"
+            "    your train_dir to see what's actually there.\n"
+            "  - To proceed despite missing classes (predictions for those\n"
+            "    will be wrong but the CSV will be complete), pass\n"
+            "    `+zeroshot.allow_missing=true`.\n"
+            "  - If names look almost identical but differ in punctuation,\n"
+            "    tweak `_normalize_name`."
         )
 
     return mapping
@@ -178,6 +234,8 @@ def main(cfg: DictConfig) -> None:
     zs = cfg.get("zeroshot", {}) or {}
     model_id = str(zs.get("model_id", "facebook/vjepa2-vitg-fpc64-384-ssv2"))
     image_size = int(zs.get("image_size", 384))
+    allow_missing = bool(zs.get("allow_missing", False))
+    missing_fallback = int(zs.get("missing_fallback_ssv2_idx", 0))
 
     num_frames = int(cfg.dataset.num_frames)
     train_dir = Path(cfg.dataset.train_dir).resolve()
@@ -187,9 +245,17 @@ def main(cfg: DictConfig) -> None:
     # ---- Step 1: discover challenge class names from disk ------------------ #
     print(f"Discovering challenge classes from: {train_dir}", flush=True)
     challenge_classes = _read_challenge_classes(train_dir)
+    expected = max(challenge_classes.keys()) + 1
+    gaps = [i for i in range(expected) if i not in challenge_classes]
     print(f"  Found {len(challenge_classes)} classes "
           f"(indices {min(challenge_classes)}..{max(challenge_classes)}).",
           flush=True)
+    if gaps:
+        print(f"  Missing index(es) in train_dir: {gaps}", flush=True)
+    print("  Discovered folders (all):", flush=True)
+    for ch_idx in sorted(challenge_classes.keys()):
+        raw, _ = challenge_classes[ch_idx]
+        print(f"    [{ch_idx:3d}] {raw}", flush=True)
 
     # ---- Step 2: read SSv2 id2label from the HF config --------------------- #
     print(f"Reading SSv2 labels from HF config: {model_id}", flush=True)
@@ -197,7 +263,12 @@ def main(cfg: DictConfig) -> None:
     print(f"  Model native classes: {len(ssv2_id2label)}.", flush=True)
 
     # ---- Step 3: build challenge -> SSv2 index mapping --------------------- #
-    mapping = _build_class_mapping(challenge_classes, ssv2_id2label)
+    mapping = _build_class_mapping(
+        challenge_classes,
+        ssv2_id2label,
+        allow_missing=allow_missing,
+        missing_fallback_ssv2_idx=missing_fallback,
+    )
     print("Class mapping (challenge_idx -> ssv2_idx | name):", flush=True)
     for ch_idx in sorted(challenge_classes.keys()):
         raw, _ = challenge_classes[ch_idx]
