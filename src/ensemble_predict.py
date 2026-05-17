@@ -161,6 +161,15 @@ def parse_args() -> argparse.Namespace:
         "dataset.train_dir from the first checkpoint's saved config.",
     )
     p.add_argument(
+        "--prior-alpha",
+        type=float,
+        default=1.0,
+        help="Strength of the prior calibration in [0, 1]. 1.0 = full Bayes "
+        "(subtract log P(y_train)); 0.5 = half-strength; 0.0 = no calibration. "
+        "Use a lower value (e.g. 0.5) if full calibration over-corrects and "
+        "top-1 drops too much. Ignored unless --calibrate-prior is set.",
+    )
+    p.add_argument(
         "--save-per-model-softmax",
         action="store_true",
         help="Also save each model's individual softmax tensor (B, num_classes) "
@@ -616,7 +625,13 @@ def main() -> None:
             prior_logits = compute_prior_logits(
                 train_dir=prior_source_dir,
                 num_classes=head_out_dim,
+                alpha=float(args.prior_alpha),
             ).to(device)
+            print(
+                f"    prior_logits ready: alpha={args.prior_alpha}, "
+                f"shape={tuple(prior_logits.shape)}",
+                flush=True,
+            )
 
         probs, labels = _run_inference(
             model, target_loader, device, total_videos=len(sample_list),

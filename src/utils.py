@@ -377,34 +377,48 @@ def compute_sample_weights(
 def compute_prior_logits(
     train_dir: str | Path,
     num_classes: int,
-    smoothing: float = 1e-9,
+    alpha: float = 1.0,
+    missing_class_logit: float = 100.0,
 ) -> torch.Tensor:
-    """Compute the log-prior log P(y) from class-folder counts in ``train_dir``.
+    """Compute α · log P(y) from class-folder counts in ``train_dir``.
 
     Used at inference time for **prior calibration**: subtracting this tensor
     from the raw model logits removes the bias inherited from class-imbalanced
     training data. Mathematically, the trained network approximates::
 
-        log P(y | x) ≈ log P(x | y) + log P(y)
+        log P(y | x) ≈ log P(x | y) + log P(y_train)
 
-    where ``log P(y)`` is the frequency of class ``y`` in the train set. By
-    subtracting ``log P(y)`` from the logits at inference, we obtain a quantity
-    proportional to ``log P(x | y)`` — independent of the training-time class
-    distribution. Calibrated logits redistribute mass from over-represented
-    classes (e.g. "Moving something up", ~3170 clips) toward under-represented
-    siblings (e.g. "Picking something up", 980 clips).
+    Subtracting ``α · log P(y_train)`` from the logits yields a quantity
+    proportional to ``P(x | y)·P(y_train)^(1-α)``. With α=1.0 this is the
+    pure Bayes posterior P(x | y); smaller α dampens the correction.
 
     Args:
         train_dir: Directory whose immediate subfolders are named
             ``"NNN_ClassName"`` with NNN the class index used in training.
-        num_classes: Number of model output classes. Slots without a matching
-            folder (e.g. index 27 in the 33-class subset) get a very negative
-            log-prior — the calibrated model effectively never predicts them.
-        smoothing: Floor added inside the log to avoid log(0).
+        num_classes: Number of model output classes.
+        alpha: Strength of the calibration in [0, 1].
+            * 0.0  -> no calibration (returns zeros).
+            * 1.0  -> full Bayes prior removal (default).
+            * 0.5  -> half-strength; safer when the model has only partially
+              memorized the prior (often the case when training with
+              class-balanced sampling or mixup).
+        missing_class_logit: Value assigned to classes that have **zero**
+            training samples (e.g. the 33-class subset where index 27 has no
+            folder). A large positive value ensures the calibrated logit
+            ``raw - missing_class_logit`` is effectively -inf, so the
+            calibrated model never predicts that index.
 
     Returns:
-        Tensor of shape ``(num_classes,)``, dtype ``float32``,
-        containing ``log(count_k / total + smoothing)``.
+        Tensor of shape ``(num_classes,)``, dtype ``float32``.
+
+    .. note::
+        Earlier versions of this function used a tiny smoothing constant
+        (``log(1e-9) ≈ -20.7``) for missing classes. That backfired: the
+        calibration step ``logit - (-20.7) = logit + 20.7`` **boosted**
+        empty classes instead of suppressing them, causing the calibrated
+        model to predict only the missing index. The fix below assigns a
+        large positive log-prior to missing classes so subtraction crushes
+        them.
     """
     path = Path(train_dir)
     if not path.is_dir():
@@ -427,8 +441,20 @@ def compute_prior_logits(
         raise RuntimeError(
             f"compute_prior_logits: no class folders / videos found under {path}"
         )
-    prior = counts / total
-    return torch.log(prior + smoothing).float()
+
+    present = counts > 0
+    # Log-prior for classes that have at least one sample.
+    safe_counts = torch.where(present, counts, torch.ones_like(counts))
+    log_prior = torch.log(safe_counts / total)
+
+    # Missing classes: large positive value → calibrated logit becomes -∞.
+    log_prior = torch.where(
+        present,
+        log_prior,
+        torch.full_like(log_prior, float(missing_class_logit)),
+    )
+
+    return (float(alpha) * log_prior).float()
 
 
 def split_train_val(

@@ -224,11 +224,14 @@ def main(cfg: DictConfig) -> None:
     calibration_cfg = cfg.get("calibration", None)
     if calibration_cfg is not None and bool(calibration_cfg.get("use_prior", False)):
         prior_train_dir = calibration_cfg.get("train_dir", cfg.dataset.train_dir)
+        prior_alpha = float(calibration_cfg.get("alpha", 1.0))
         prior_logits = compute_prior_logits(
-            train_dir=prior_train_dir, num_classes=num_classes
+            train_dir=prior_train_dir,
+            num_classes=num_classes,
+            alpha=prior_alpha,
         ).to(device)
         print(
-            f"\nPrior calibration: ENABLED  (computed from {prior_train_dir})",
+            f"\nPrior calibration: ENABLED  (alpha={prior_alpha}, from {prior_train_dir})",
             flush=True,
         )
     else:
