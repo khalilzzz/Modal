@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -371,6 +372,63 @@ def compute_sample_weights(
             per_class[c] = 1.0 / _math.sqrt(float(n))
 
     return [per_class[label] for _path, label in samples]
+
+
+def compute_prior_logits(
+    train_dir: str | Path,
+    num_classes: int,
+    smoothing: float = 1e-9,
+) -> torch.Tensor:
+    """Compute the log-prior log P(y) from class-folder counts in ``train_dir``.
+
+    Used at inference time for **prior calibration**: subtracting this tensor
+    from the raw model logits removes the bias inherited from class-imbalanced
+    training data. Mathematically, the trained network approximates::
+
+        log P(y | x) ≈ log P(x | y) + log P(y)
+
+    where ``log P(y)`` is the frequency of class ``y`` in the train set. By
+    subtracting ``log P(y)`` from the logits at inference, we obtain a quantity
+    proportional to ``log P(x | y)`` — independent of the training-time class
+    distribution. Calibrated logits redistribute mass from over-represented
+    classes (e.g. "Moving something up", ~3170 clips) toward under-represented
+    siblings (e.g. "Picking something up", 980 clips).
+
+    Args:
+        train_dir: Directory whose immediate subfolders are named
+            ``"NNN_ClassName"`` with NNN the class index used in training.
+        num_classes: Number of model output classes. Slots without a matching
+            folder (e.g. index 27 in the 33-class subset) get a very negative
+            log-prior — the calibrated model effectively never predicts them.
+        smoothing: Floor added inside the log to avoid log(0).
+
+    Returns:
+        Tensor of shape ``(num_classes,)``, dtype ``float32``,
+        containing ``log(count_k / total + smoothing)``.
+    """
+    path = Path(train_dir)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Prior train dir not found: {path}")
+
+    counts = torch.zeros(num_classes, dtype=torch.float64)
+    for entry in sorted(path.iterdir()):
+        if not entry.is_dir():
+            continue
+        match = re.match(r"^(\d+)_", entry.name)
+        if match is None:
+            continue
+        idx = int(match.group(1))
+        if idx < 0 or idx >= num_classes:
+            continue
+        counts[idx] = float(sum(1 for v in entry.iterdir() if v.is_dir()))
+
+    total = counts.sum().item()
+    if total <= 0:
+        raise RuntimeError(
+            f"compute_prior_logits: no class folders / videos found under {path}"
+        )
+    prior = counts / total
+    return torch.log(prior + smoothing).float()
 
 
 def split_train_val(

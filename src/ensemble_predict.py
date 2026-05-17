@@ -62,7 +62,7 @@ from torch.utils.data import DataLoader
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from train import build_model
-from utils import build_transforms
+from utils import build_transforms, compute_prior_logits
 
 # Reuse helpers from create_submission without modifying it.
 from create_submission import (
@@ -146,6 +146,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=10)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument(
+        "--calibrate-prior",
+        action="store_true",
+        help="Subtract log P(y) (train-set class frequency) from each model's "
+        "raw logits before softmax. Removes the inherited class-imbalance "
+        "bias; recovers recall on under-represented twins (e.g. 011 vs 014). "
+        "Pure post-hoc transform; no checkpoint or model change needed.",
+    )
+    p.add_argument(
+        "--prior-train-dir",
+        type=str,
+        default=None,
+        help="Source of class counts for --calibrate-prior. Defaults to "
+        "dataset.train_dir from the first checkpoint's saved config.",
+    )
+    p.add_argument(
         "--save-per-model-softmax",
         action="store_true",
         help="Also save each model's individual softmax tensor (B, num_classes) "
@@ -187,11 +202,15 @@ def _run_inference(
     device: torch.device,
     total_videos: int,
     tag: str = "",
+    prior_logits: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run inference; return (softmax, labels) both on CPU.
 
     Labels are whatever the dataset's sample_list contains (true labels for a
     labelled set, dummy 0s in submission mode).
+
+    If ``prior_logits`` is provided, it is subtracted from the raw logits
+    before softmax — i.e. inference-time prior calibration.
     """
     model.eval()
     probs_chunks: List[torch.Tensor] = []
@@ -202,6 +221,8 @@ def _run_inference(
     for batch_idx, (video_batch, labels) in enumerate(loader, start=1):
         video_batch = video_batch.to(device)
         logits = model(video_batch)
+        if prior_logits is not None:
+            logits = logits - prior_logits
         probs = F.softmax(logits, dim=-1).cpu()
         probs_chunks.append(probs)
         label_chunks.append(labels.cpu())
@@ -523,6 +544,24 @@ def main() -> None:
                 flush=True,
             )
 
+    # ---- Optional prior calibration: load class counts from the first
+    # checkpoint's saved train_dir (unless overridden). Materialized lazily
+    # once we know num_classes (after the first model loads).
+    prior_logits: Optional[torch.Tensor] = None
+    prior_source_dir: Optional[Path] = None
+    if args.calibrate_prior:
+        first_ckpt = torch.load(args.checkpoints[0], map_location="cpu")
+        first_cfg = OmegaConf.create(first_ckpt["config"])
+        prior_source_dir = Path(
+            args.prior_train_dir
+            if args.prior_train_dir is not None
+            else first_cfg.dataset.train_dir
+        ).resolve()
+        print(
+            f"\nPrior calibration: ENABLED  (counts from {prior_source_dir})",
+            flush=True,
+        )
+
     # ---- Run each checkpoint sequentially: target + (optional) calibration
     per_model_softmax: Dict[str, torch.Tensor] = {}
     per_model_cal_softmax: Dict[str, torch.Tensor] = {}
@@ -560,9 +599,28 @@ def main() -> None:
             f"    target: {len(sample_list)} clips, batch_size={args.batch_size}",
             flush=True,
         )
+
+        # Lazily materialize the prior once we know num_classes from the
+        # first model's output dim.
+        if args.calibrate_prior and prior_logits is None:
+            # `model` is loaded — use its head to learn num_classes without
+            # paying the cost of a dummy forward.
+            head_out_dim = None
+            for module in model.modules():
+                if isinstance(module, torch.nn.Linear):
+                    head_out_dim = module.out_features
+            if head_out_dim is None:
+                # Fall back to one forward pass.
+                head_out_dim = int(meta["config"].model.num_classes)
+            assert prior_source_dir is not None
+            prior_logits = compute_prior_logits(
+                train_dir=prior_source_dir,
+                num_classes=head_out_dim,
+            ).to(device)
+
         probs, labels = _run_inference(
             model, target_loader, device, total_videos=len(sample_list),
-            tag="target",
+            tag="target", prior_logits=prior_logits,
         )
         per_model_softmax[ckpt_path.name] = probs
         if num_classes is None:
@@ -598,7 +656,7 @@ def main() -> None:
             )
             cal_probs, cal_labs = _run_inference(
                 model, cal_loader, device, total_videos=len(cal_sample_list),
-                tag="calib",
+                tag="calib", prior_logits=prior_logits,
             )
             per_model_cal_softmax[ckpt_path.name] = cal_probs
             if cal_labels is None:

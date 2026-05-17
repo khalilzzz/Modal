@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader
 
 from dataset.video_dataset import VideoFrameDataset, collect_video_samples
 from train import build_model
-from utils import build_transforms, set_seed
+from utils import build_transforms, compute_prior_logits, set_seed
 
 
 def _build_class_names(val_dir: Path, num_classes: int) -> List[str]:
@@ -213,6 +213,27 @@ def main(cfg: DictConfig) -> None:
 
     num_classes = int(cfg.model.num_classes)
 
+    # ---- Optional prior calibration (opt-in, default OFF) ----------------
+    # Enable with:  +calibration.use_prior=true
+    # Override source with: +calibration.train_dir=/path/to/train  (defaults
+    # to dataset.train_dir from the loaded config). Subtracts log P(y) from
+    # the raw logits at inference time, undoing the class-frequency bias the
+    # model picked up at training. This is purely post-hoc — your existing
+    # checkpoint is unchanged.
+    prior_logits: torch.Tensor | None = None
+    calibration_cfg = cfg.get("calibration", None)
+    if calibration_cfg is not None and bool(calibration_cfg.get("use_prior", False)):
+        prior_train_dir = calibration_cfg.get("train_dir", cfg.dataset.train_dir)
+        prior_logits = compute_prior_logits(
+            train_dir=prior_train_dir, num_classes=num_classes
+        ).to(device)
+        print(
+            f"\nPrior calibration: ENABLED  (computed from {prior_train_dir})",
+            flush=True,
+        )
+    else:
+        print("\nPrior calibration: disabled (set +calibration.use_prior=true to enable)")
+
     correct_top1 = 0
     correct_top5 = 0
     total = 0
@@ -227,6 +248,10 @@ def main(cfg: DictConfig) -> None:
             video_batch = video_batch.to(device)
             labels = labels.to(device)
             logits = model(video_batch)  # (B, num_classes)
+
+            # Prior calibration (no-op if prior_logits is None).
+            if prior_logits is not None:
+                logits = logits - prior_logits
 
             # Top-1: argmax class matches label
             predictions_top1 = logits.argmax(dim=1)
