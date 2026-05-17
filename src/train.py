@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import hydra
 import torch
@@ -33,7 +33,10 @@ from models.cnn_transformer import CNNTransformer
 from models.tsm import TSM
 from models.two_stream_transformer import TwoStreamTransformer
 from utils import (
+    FocalLoss,
     build_transforms,
+    compute_class_weights,
+    compute_prior_logits,
     compute_sample_weights,
     set_seed,
     split_train_val,
@@ -268,6 +271,7 @@ def train_one_epoch(
     device: torch.device,
     scaler: GradScaler,
     use_amp: bool,
+    log_prior_for_train: Optional[torch.Tensor] = None,
     use_mixup: bool = False,
     mixup_alpha: float = 0.2,
     use_cutmix: bool = False,
@@ -303,17 +307,25 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device.type, enabled=use_amp):
             logits = model(video_batch)  # (B, num_classes)
+            # Logit Adjustment (Menon et al. 2020): add tau*log_prior to logits
+            # at TRAINING time so the network learns to produce log P(x|y)
+            # natively. At eval, the raw logits are used (no adjustment), which
+            # gives the correctly de-biased predictions.
+            logits_for_loss = logits
+            if log_prior_for_train is not None:
+                logits_for_loss = logits + log_prior_for_train
             if lam < 1.0:
-                loss = lam * loss_fn(logits, labels_a) + (1.0 - lam) * loss_fn(
-                    logits, labels_b
+                loss = lam * loss_fn(logits_for_loss, labels_a) + (1.0 - lam) * loss_fn(
+                    logits_for_loss, labels_b
                 )
             else:
-                loss = loss_fn(logits, labels_a)
+                loss = loss_fn(logits_for_loss, labels_a)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += float(loss.item()) * labels.size(0)
+        # Accuracy is computed on RAW logits to mirror inference behavior.
         predictions = logits.argmax(dim=1)
         # Match against the primary (un-permuted) label — biased but consistent.
         correct += int((predictions == labels_a).sum().item())
@@ -494,7 +506,72 @@ def main(cfg: DictConfig) -> None:
         best_val_accuracy = float(ckpt.get("val_accuracy", 0.0))
         print(f"Resuming best val accuracy from checkpoint: {best_val_accuracy:.4f}")
 
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # ---- Loss function: opt-in Focal Loss (default = CE with smoothing) ----
+    # Knobs (all default to legacy behavior):
+    #   training.use_focal_loss      (bool, default False)
+    #   training.focal_gamma         (float, default 2.0)
+    #   training.use_class_weights   (bool, default False)
+    #   training.class_weights_method  ("inv_freq" | "inv_sqrt_freq" |
+    #                                   "effective_num" | "none", default "inv_sqrt_freq")
+    #   training.class_weights_beta  (float, default 0.9999, only for "effective_num")
+    #   training.label_smoothing     (float, default 0.1)
+    use_focal_loss = bool(cfg.training.get("use_focal_loss", False))
+    use_class_weights = bool(cfg.training.get("use_class_weights", False))
+    label_smoothing = float(cfg.training.get("label_smoothing", 0.1))
+    class_weights_tensor: Optional[torch.Tensor] = None
+    if use_class_weights:
+        class_weights_method = str(cfg.training.get("class_weights_method", "inv_sqrt_freq"))
+        class_weights_beta = float(cfg.training.get("class_weights_beta", 0.9999))
+        class_weights_tensor = compute_class_weights(
+            train_samples,
+            num_classes=int(cfg.model.num_classes),
+            method=class_weights_method,
+            beta=class_weights_beta,
+        ).to(device)
+        print(
+            f"Class weights: ENABLED  (method={class_weights_method}, "
+            f"mean={float(class_weights_tensor.mean()):.3f})"
+        )
+
+    if use_focal_loss:
+        focal_gamma = float(cfg.training.get("focal_gamma", 2.0))
+        loss_fn: nn.Module = FocalLoss(
+            gamma=focal_gamma, alpha_weight=class_weights_tensor
+        ).to(device)
+        # Focal loss + label smoothing is a non-standard combination — warn if both.
+        if label_smoothing > 0.0:
+            print(
+                f"NOTE: focal_loss=True ignores label_smoothing (was {label_smoothing}). "
+                "The focusing factor already provides implicit regularization on easy samples."
+            )
+        print(f"Loss: FocalLoss(gamma={focal_gamma}, alpha_weight={'yes' if class_weights_tensor is not None else 'no'})")
+    else:
+        loss_fn = nn.CrossEntropyLoss(
+            weight=class_weights_tensor, label_smoothing=label_smoothing
+        ).to(device)
+        print(
+            f"Loss: CrossEntropyLoss(label_smoothing={label_smoothing}, "
+            f"weight={'yes' if class_weights_tensor is not None else 'no'})"
+        )
+
+    # ---- Logit Adjustment (Menon et al. 2020): opt-in, default OFF ---------
+    #   training.use_logit_adjustment  (bool, default False)
+    #   training.logit_adjustment_tau  (float, default 1.0)
+    log_prior_for_train: Optional[torch.Tensor] = None
+    if bool(cfg.training.get("use_logit_adjustment", False)):
+        la_tau = float(cfg.training.get("logit_adjustment_tau", 1.0))
+        la_train_dir = cfg.training.get("logit_adjustment_train_dir", cfg.dataset.train_dir)
+        log_prior_for_train = compute_prior_logits(
+            train_dir=la_train_dir,
+            num_classes=int(cfg.model.num_classes),
+            alpha=la_tau,
+            missing_class_logit=100.0,
+        ).to(device)
+        print(
+            f"Logit adjustment: ENABLED  (tau={la_tau}, source={la_train_dir})  "
+            "— inference uses raw logits (no post-hoc calibration needed)."
+        )
+
     optimizer_name = str(cfg.training.get("optimizer", "adam")).lower()
     weight_decay = float(cfg.training.get("weight_decay", 0.0))
     lr = float(cfg.training.lr)
@@ -600,6 +677,7 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(int(cfg.training.epochs)):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, loss_fn, optimizer, device, scaler, use_amp,
+            log_prior_for_train=log_prior_for_train,
             **mixup_kwargs,
         )
         val_loss, val_acc = evaluate_epoch(

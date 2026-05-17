@@ -18,6 +18,8 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -372,6 +374,112 @@ def compute_sample_weights(
             per_class[c] = 1.0 / _math.sqrt(float(n))
 
     return [per_class[label] for _path, label in samples]
+
+
+def compute_class_weights(
+    samples: List[Tuple[Path, int]],
+    num_classes: int,
+    method: str = "inv_freq",
+    beta: float = 0.9999,
+) -> torch.Tensor:
+    """Per-class scalar weights tensor for losses like ``FocalLoss(alpha_weight=...)``.
+
+    Mirrors ``compute_sample_weights`` but yields a length-``num_classes``
+    tensor instead of per-sample weights. Weights are normalized so their
+    mean equals 1.0 (so the absolute loss magnitude stays comparable to
+    plain cross-entropy).
+
+    Methods:
+        ``"none"``           -> all 1s (no rebalancing).
+        ``"inv_freq"``       -> w_k = 1 / count_k (full inverse frequency).
+        ``"inv_sqrt_freq"``  -> w_k = 1 / sqrt(count_k) (softer; safer).
+        ``"effective_num"``  -> Class-Balanced Loss (Cui et al. 2019):
+                                w_k = (1 - beta) / (1 - beta**count_k).
+                                Smoothly interpolates between "none" (beta=0)
+                                and "inv_freq" (beta -> 1). beta=0.9999 is
+                                a common default for fine-tuning regimes.
+
+    Missing classes (count_k == 0) get weight 0 — neutralized in the loss.
+    """
+    if method not in {"none", "inv_freq", "inv_sqrt_freq", "effective_num"}:
+        raise ValueError(f"Unknown class-weight method: {method!r}")
+
+    counts = torch.zeros(num_classes, dtype=torch.float64)
+    for _path, label in samples:
+        if 0 <= int(label) < num_classes:
+            counts[int(label)] += 1.0
+
+    if method == "none":
+        return torch.ones(num_classes, dtype=torch.float32)
+
+    if method == "inv_freq":
+        weights = torch.where(counts > 0, 1.0 / counts.clamp(min=1.0), torch.zeros_like(counts))
+    elif method == "inv_sqrt_freq":
+        weights = torch.where(counts > 0, 1.0 / counts.clamp(min=1.0).sqrt(), torch.zeros_like(counts))
+    else:  # "effective_num"
+        b = float(beta)
+        eff = 1.0 - torch.pow(torch.tensor(b, dtype=torch.float64), counts)
+        weights = torch.where(counts > 0, (1.0 - b) / eff.clamp(min=1e-12), torch.zeros_like(counts))
+
+    present = (weights > 0).sum().clamp(min=1)
+    weights = weights / (weights.sum() / present.double())  # mean over present classes = 1
+    return weights.float()
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss (Lin et al. 2017) for multi-class classification.
+
+    .. math::
+        \\text{FL}(p_t) = -\\alpha_t \\cdot (1 - p_t)^{\\gamma} \\cdot \\log(p_t)
+
+    where ``p_t`` is the softmax probability assigned to the true class.
+    Compared to vanilla cross-entropy, the ``(1 - p_t)^gamma`` factor
+    **down-weights easy examples** (high ``p_t``) and **focuses gradient on
+    hard ones** (low ``p_t``, often the confidently-wrong predictions where
+    the model is fooled by a semantic twin).
+
+    ``gamma = 0`` recovers weighted cross-entropy. ``gamma = 2`` is the
+    typical setting from the paper and works well on class-imbalanced
+    classification.
+
+    Note: focal loss is **incompatible with label smoothing** in a clean
+    formulation (the focusing factor is per-true-class). If you previously
+    relied on smoothing for regularization, consider keeping it OFF when
+    using focal loss — the focusing effect provides similar implicit
+    regularization on easy examples.
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha_weight: Optional[torch.Tensor] = None,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.gamma = float(gamma)
+        self.reduction = reduction
+        if alpha_weight is not None:
+            self.register_buffer("alpha_weight", alpha_weight.float())
+        else:
+            self.alpha_weight = None  # type: ignore[assignment]
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=-1)
+        target = target.long()
+        log_p_t = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        p_t = log_p_t.exp()
+        focal_factor = (1.0 - p_t).clamp(min=0.0, max=1.0).pow(self.gamma)
+        loss = -focal_factor * log_p_t
+
+        if self.alpha_weight is not None:
+            alpha_t = self.alpha_weight.to(logits.device).gather(0, target)
+            loss = alpha_t * loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
 def compute_prior_logits(
