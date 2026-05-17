@@ -28,7 +28,7 @@ Examples:
         --checkpoints a.pt b.pt c.pt \\
         --strategy uniform
 
-    # Manual scalar weights (V-JEPA 2 gets 4x)
+    # Manual scalar weights
     uv run python src/ensemble_predict.py \\
         --checkpoints tsm.pt cnn_t.pt vjepa2.pt \\
         --strategy scalar --weights 1.0 1.0 4.0

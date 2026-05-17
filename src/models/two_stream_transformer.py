@@ -6,11 +6,21 @@ Pipeline (see two_stream_transformer_design.md for the full rationale):
     RGB    stream CNN + spatial self-attention -> (B, T, C_rgb)
     Motion stream CNN + spatial self-attention -> (B, T, C_mot)
         (motion input = frame[t] - frame[t-1], zero for t=0)
-    Concat -> Linear projection -> (B, T, d_model)
+    Concat -> Linear projection -> LayerNorm + Dropout -> (B, T, d_model)
     Prepend learnable [CLS] -> (B, T+1, d_model)
     + sinusoidal positional encoding
     Transformer encoder (multi-head self-attention + FFN, pre-norm)
-    [CLS] -> Linear -> (B, num_classes)
+    LayerNorm + head_dropout on [CLS] -> Linear -> (B, num_classes)
+
+Robustness choices for from-scratch training on a small dataset:
+  * LayerNorm right after `frame_proj` keeps the transformer input distribution
+    stable (otherwise the random-init Conv backbones produce noisy features
+    that the transformer struggles to absorb).
+  * Separate `head_dropout` (0.5 default) provides strong regularization on
+    the classifier — the head is the most overfit-prone part on tiny data.
+  * Explicit weight init: Kaiming-normal for Conv2d (ReLU + BN networks),
+    Xavier-uniform for Linear, trunc-normal(std=0.02) for the classifier and
+    the [CLS] token. Avoids huge first-step gradients.
 """
 
 from __future__ import annotations
@@ -143,6 +153,7 @@ class TwoStreamTransformer(nn.Module):
         num_layers: int = 4,
         dim_feedforward: int = 1024,
         dropout: float = 0.2,
+        head_dropout: float = 0.5,
     ) -> None:
         super().__init__()
         del pretrained  # Track A: never used
@@ -152,10 +163,13 @@ class TwoStreamTransformer(nn.Module):
 
         fused_dim = self.rgb_stream.out_channels + self.motion_stream.out_channels
         self.frame_proj = nn.Linear(fused_dim, d_model)
+        # LayerNorm on the per-frame projected features: keeps the input
+        # distribution to the transformer stable when the upstream Conv
+        # backbones are random-init (Track A).
+        self.frame_norm = nn.LayerNorm(d_model)
         self.frame_dropout = nn.Dropout(dropout)
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
 
         self.pos_enc = _SinusoidalPositionalEncoding(d_model)
 
@@ -169,7 +183,43 @@ class TwoStreamTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.out_norm = nn.LayerNorm(d_model)
+        # Strong dropout right before the classifier: on a small dataset the
+        # head overfits faster than the backbone.
+        self.head_dropout = nn.Dropout(head_dropout)
         self.classifier = nn.Linear(d_model, num_classes)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Explicit init suited for ReLU+BN convnets and a Transformer head.
+
+        * Conv2d  : Kaiming-normal (fan_out, ReLU) — proper for the ResNet stem
+                    and residual blocks (PyTorch's default is Kaiming-uniform
+                    with `a=sqrt(5)`, which is awkward for ReLU).
+        * Linear  : Xavier-uniform (works well for attention/FFN at init).
+        * LayerNorm / BatchNorm : weight=1, bias=0.
+        * cls_token, classifier : trunc_normal_(std=0.02) — keeps initial
+                    logits small, avoiding huge first-step gradients.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Overrides for tokens / classifier — small magnitude.
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         """
@@ -191,6 +241,7 @@ class TwoStreamTransformer(nn.Module):
         # --- Per-frame fusion --------------------------------------------
         fused = torch.cat([rgb_feats, motion_feats], dim=-1)  # (B, T, 2*c_out)
         tokens = self.frame_proj(fused)                       # (B, T, d_model)
+        tokens = self.frame_norm(tokens)                      # stabilize for transformer
         tokens = self.frame_dropout(tokens)
 
         # --- Prepend [CLS] + positional encoding -------------------------
@@ -202,4 +253,6 @@ class TwoStreamTransformer(nn.Module):
         seq = self.transformer(seq)
         seq = self.out_norm(seq)
 
-        return self.classifier(seq[:, 0])                    # [CLS] -> logits
+        # --- Classifier on [CLS] -----------------------------------------
+        cls_out = self.head_dropout(seq[:, 0])
+        return self.classifier(cls_out)

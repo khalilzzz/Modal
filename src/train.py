@@ -87,6 +87,7 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_layers=int(cfg.model.get("num_layers", 4)),
             dim_feedforward=int(cfg.model.get("dim_feedforward", 1024)),
             dropout=float(cfg.model.get("dropout", 0.2)),
+            head_dropout=float(cfg.model.get("head_dropout", 0.5)),
         )
     if name == "tsm":
         # TSM requires num_segments == dataset.num_frames (asserted in forward).
