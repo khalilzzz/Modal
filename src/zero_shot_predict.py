@@ -20,14 +20,28 @@ Usage (from ``src/``)::
 The list of challenge classes is read from ``dataset.train_dir`` by walking
 its top-level ``NNN_Class_name`` folders. The integer index is the leading
 ``NNN`` so it matches what ``VideoFrameDataset`` will use during evaluation.
+
+Crash-safe streaming writes
+---------------------------
+Predictions are written incrementally to ``dataset.submission_output`` after
+every batch (single write + flush + fsync). If the process is killed or the
+machine loses power, just relaunch the same command: the script heals any
+partial trailing line in the CSV, reads which videos have already been
+predicted, and resumes on the remaining ones. Toggles::
+
+    +zeroshot.resume=false    # delete the existing CSV and start from scratch
+    +zeroshot.fsync=false     # skip the per-batch fsync (faster but loses
+                              # the last few batches on power loss)
 """
 
 from __future__ import annotations
 
 import csv
+import io
+import os
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import hydra
 import torch
@@ -64,6 +78,79 @@ def _normalize_name(name: str) -> str:
     n = re.sub(r"^\d+_", "", name)
     n = _NORMALIZE_RE.sub(" ", n.lower()).strip()
     return re.sub(r"\s+", " ", n)
+
+
+# --------------------------------------------------------------------------- #
+# Crash-safe submission writing (resume after power loss / SIGKILL)           #
+# --------------------------------------------------------------------------- #
+
+
+def _heal_csv(path: Path) -> None:
+    """Truncate any orphan bytes after the last newline. Idempotent.
+
+    If the previous run crashed mid-write (power loss, SIGKILL), the file may
+    end with a partial row that has no trailing ``\\n``. We scan from the end,
+    find the last newline, and truncate everything after it. After this, every
+    line the parser sees is complete.
+    """
+    if not path.is_file():
+        return
+    with open(path, "rb+") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        if size == 0:
+            return
+        chunk = 4096
+        pos = size
+        while pos > 0:
+            read_at = max(0, pos - chunk)
+            f.seek(read_at)
+            data = f.read(pos - read_at)
+            nl = data.rfind(b"\n")
+            if nl >= 0:
+                f.truncate(read_at + nl + 1)
+                return
+            pos = read_at
+        f.truncate(0)
+
+
+def _load_done_video_names(path: Path, num_classes: int) -> Set[str]:
+    """Return the set of video names already present in the submission CSV.
+
+    Strict validation per row: exactly 2 columns, non-empty name, second column
+    parseable as int in ``[0, num_classes)``. The header row naturally fails
+    (``"predicted_class"`` is not an int) and is silently dropped, as are any
+    malformed rows. Those videos will simply be re-predicted on resume.
+    """
+    if not path.is_file():
+        return set()
+    done: Set[str] = set()
+    with path.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if len(row) != 2:
+                continue
+            name, label = row[0], row[1]
+            if not name:
+                continue
+            try:
+                lbl = int(label)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= lbl < num_classes:
+                done.add(name)
+    return done
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """fsync the directory entry so a freshly created file's existence is durable."""
+    try:
+        fd = os.open(str(dir_path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +323,15 @@ def main(cfg: DictConfig) -> None:
     image_size = int(zs.get("image_size", 384))
     allow_missing = bool(zs.get("allow_missing", False))
     missing_fallback = int(zs.get("missing_fallback_ssv2_idx", 0))
+    # Crash-safety knobs:
+    #   resume=true (default) -> if the output CSV already exists, heal any
+    #     partial trailing line, skip already-predicted videos, and append.
+    #   resume=false -> delete any existing CSV and start fresh.
+    #   fsync=true (default) -> after each batch, call fsync() to force the
+    #     OS to write to physical media. Adds a few ms per batch; survives
+    #     power loss. Disable only if you're sure the run won't be interrupted.
+    resume = bool(zs.get("resume", True))
+    use_fsync = bool(zs.get("fsync", True))
 
     num_frames = int(cfg.dataset.num_frames)
     train_dir = Path(cfg.dataset.train_dir).resolve()
@@ -300,6 +396,34 @@ def main(cfg: DictConfig) -> None:
         video_names, video_dirs = discover_all_test_videos(test_dir)
     print(f"  {len(video_dirs)} test clip folders.", flush=True)
 
+    # ---- Resume support: heal partial CSV + filter already-done videos ---- #
+    if not resume and output_path.is_file():
+        print(f"  resume=false: deleting existing {output_path}", flush=True)
+        output_path.unlink()
+
+    done_set: Set[str] = set()
+    if resume:
+        _heal_csv(output_path)
+        done_set = _load_done_video_names(output_path, int(cfg.num_classes))
+
+    if done_set:
+        unknown = done_set - set(video_names)
+        if unknown:
+            print(f"  WARNING: {len(unknown)} name(s) in existing CSV are not "
+                  f"in the current test list — ignored.", flush=True)
+        before = len(video_names)
+        kept = [
+            (n, d) for n, d in zip(video_names, video_dirs) if n not in done_set
+        ]
+        video_names = [n for n, _ in kept]
+        video_dirs = [d for _, d in kept]
+        print(f"  Resume: {before - len(video_names)}/{before} clips already "
+              f"done; {len(video_names)} remaining.", flush=True)
+        if not video_names:
+            print(f"Nothing to do: every clip is already in {output_path}.",
+                  flush=True)
+            return
+
     sample_list: List[Tuple[Path, int]] = [(p, 0) for p in video_dirs]
     dataset = VideoFrameDataset(
         root_dir=test_dir,
@@ -316,34 +440,68 @@ def main(cfg: DictConfig) -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # ---- Step 6: inference loop ------------------------------------------- #
+    # ---- Step 6: streaming inference with per-batch durable writes -------- #
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    need_header = not output_path.is_file() or output_path.stat().st_size == 0
+
     print(f"Inference: {len(dataset)} clips, batch_size={batch_size}, "
           f"{len(loader)} batches", flush=True)
-    preds: List[int] = []
+    print(f"  {'Writing fresh CSV' if need_header else 'Appending to existing CSV'}"
+          f": {output_path}", flush=True)
+
     n_batches = len(loader)
     log_interval = max(1, n_batches // 10)
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader, start=1):
-            video_batch = batch[0].to(device)
-            logits = model(video_batch)
-            preds.extend(int(p) for p in logits.argmax(dim=1).cpu().tolist())
-            if batch_idx % log_interval == 0 or batch_idx == n_batches:
-                print(f"  batch {batch_idx}/{n_batches}", flush=True)
+    rows_this_run = 0
+    cursor = 0
 
-    if len(preds) != len(video_names):
-        raise RuntimeError(
-            f"Prediction count {len(preds)} != video count {len(video_names)}"
-        )
+    # Open in append mode. _heal_csv ran earlier, so the file (if it exists)
+    # ends cleanly on a newline. We serialise each batch into an in-memory
+    # buffer and issue a single write() per batch; on Linux ext4 with
+    # O_APPEND, writes < PIPE_BUF (4KB) are atomic, so a crash mid-write
+    # either keeps the whole batch or loses it whole. After every batch we
+    # flush() + fsync() so completed batches are durable on disk even if the
+    # machine loses power immediately afterwards.
+    csv_file = output_path.open("a", newline="", encoding="utf-8")
+    try:
+        if need_header:
+            csv_file.write("video_name,predicted_class\n")
+            csv_file.flush()
+            if use_fsync:
+                os.fsync(csv_file.fileno())
+                _fsync_dir(output_path.parent)
 
-    # ---- Step 7: write submission CSV (same format as create_submission.py) #
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Writing submission CSV: {output_path}", flush=True)
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["video_name", "predicted_class"])
-        for name, pred in zip(video_names, preds):
-            w.writerow([name, pred])
-    print(f"Done. Wrote {len(preds)} rows to {output_path}", flush=True)
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader, start=1):
+                video_batch = batch[0].to(device)
+                logits = model(video_batch)
+                preds = [int(p) for p in logits.argmax(dim=1).cpu().tolist()]
+                actual_bs = len(preds)
+                batch_names = video_names[cursor:cursor + actual_bs]
+                cursor += actual_bs
+
+                buf = io.StringIO()
+                bw = csv.writer(buf)
+                for name, pred in zip(batch_names, preds):
+                    bw.writerow([name, pred])
+                csv_file.write(buf.getvalue())
+                csv_file.flush()
+                if use_fsync:
+                    os.fsync(csv_file.fileno())
+
+                rows_this_run += actual_bs
+                if batch_idx % log_interval == 0 or batch_idx == n_batches:
+                    print(f"  batch {batch_idx}/{n_batches} "
+                          f"(+{rows_this_run} rows persisted this run)",
+                          flush=True)
+    finally:
+        csv_file.close()
+
+    if cursor != len(video_names):
+        print(f"WARNING: wrote {cursor} rows but expected {len(video_names)} — "
+              "CSV is still valid for what was written.", flush=True)
+
+    print(f"Done. CSV at {output_path} (+{rows_this_run} rows this run).",
+          flush=True)
 
 
 if __name__ == "__main__":
