@@ -185,6 +185,26 @@ def build_model(cfg: DictConfig) -> nn.Module:
             ),
         )
 
+    if name == "b_mvitv2":
+        # MViT / MViTv2 — hierarchical transformer, architecturally diverse
+        # from V-JEPA 2 / VideoMAE / TimeSformer. `model_id` selects the
+        # variant (Base ≈ 36M params, Large ≈ 213M).
+        from models.b_mvitv2 import MViTv2Classifier
+
+        return MViTv2Classifier(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            model_id=str(
+                cfg.model.get("model_id", "facebook/mvit-base-finetuned-ssv2")
+            ),
+            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
+            image_size=int(cfg.model.get("image_size", 224)),
+            freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
+            use_gradient_checkpointing=bool(
+                cfg.model.get("use_gradient_checkpointing", False)
+            ),
+        )
+
     raise ValueError(f"Unknown model.name: {name}")
 
 
@@ -560,7 +580,9 @@ def main(cfg: DictConfig) -> None:
     log_prior_for_train: Optional[torch.Tensor] = None
     if bool(cfg.training.get("use_logit_adjustment", False)):
         la_tau = float(cfg.training.get("logit_adjustment_tau", 1.0))
-        la_train_dir = cfg.training.get("logit_adjustment_train_dir", cfg.dataset.train_dir)
+        la_train_dir = cfg.training.get("logit_adjustment_train_dir", None)
+        if la_train_dir is None:
+            la_train_dir = cfg.dataset.train_dir
         log_prior_for_train = compute_prior_logits(
             train_dir=la_train_dir,
             num_classes=int(cfg.model.num_classes),

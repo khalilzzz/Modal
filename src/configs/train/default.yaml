@@ -61,3 +61,20 @@ training:
   use_cutmix: false
   cutmix_alpha: 1.0
   mix_prob: 1.0
+  # ---- Loss function (all OFF by default — preserves legacy CE behavior) ----
+  # Cross-entropy with label_smoothing=0.1 stays the default unchanged.
+  label_smoothing: 0.1
+  # Focal Loss (Lin et al. 2017): focuses gradient on hard examples. γ=2 typical.
+  use_focal_loss: false
+  focal_gamma: 2.0
+  # Per-class weighting in the loss (works with CE or FocalLoss).
+  # method options: "none", "inv_freq", "inv_sqrt_freq", "effective_num"
+  use_class_weights: false
+  class_weights_method: inv_sqrt_freq
+  class_weights_beta: 0.9999  # only used by "effective_num"
+  # Logit Adjustment (Menon et al. 2020): adds τ·log P(y) to logits AT TRAINING
+  # so the network learns log P(x|y) natively. Inference uses raw logits — do
+  # NOT apply +calibration.use_prior=true on a checkpoint trained with this.
+  use_logit_adjustment: false
+  logit_adjustment_tau: 1.0
+  logit_adjustment_train_dir: null  # null → falls back to dataset.train_dir
