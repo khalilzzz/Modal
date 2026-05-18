@@ -22,3 +22,13 @@ model:
   # Linear probe: freeze backbone, only train the new classifier head. Faster
   # but caps quality. Full finetune (false) is what unlocks the model's ceiling.
   freeze_backbone: false
+
+  # ----- LoRA (parameter-efficient fine-tuning) ----------------------------- #
+  # See b_vjepa2_1b.yaml for the full description. Defaults are off, so this
+  # config keeps the original full-finetune behaviour.
+  use_lora: false
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: null
+  lora_bias: none

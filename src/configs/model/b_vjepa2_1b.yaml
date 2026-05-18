@@ -29,3 +29,17 @@ model:
   # it, even batch_size=1 OOMs because of the 64×(384/16)² ≈ 18k attention
   # tokens per block × 40 blocks.
   use_gradient_checkpointing: true
+
+  # ----- LoRA (parameter-efficient fine-tuning) ----------------------------- #
+  # When use_lora=true, the backbone is frozen and small low-rank adapter
+  # matrices are inserted in the attention projections. Trains ~0.5% of the
+  # model's parameters instead of all 1B — much faster, lower VRAM, and far
+  # less prone to catastrophic forgetting of the SSv2 pretraining.
+  # Use a dedicated experiment (e.g. `experiment=b_vjepa2_1b_lora`) that picks
+  # an LR ~10x larger than full FT (LoRA adapters tolerate it).
+  use_lora: false
+  lora_r: 16                       # rank — 8/16/32 typical; raise if underfitting
+  lora_alpha: 32                   # scaling; convention is alpha = 2 * r
+  lora_dropout: 0.05               # standard for ViT LoRA
+  lora_target_modules: null        # null -> wrapper default (q/k/v/o projections)
+  lora_bias: none                  # "none" / "all" / "lora_only"

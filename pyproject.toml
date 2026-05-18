@@ -15,6 +15,10 @@ dependencies = [
     # (VideoMAE, TimeSformer). Lazy-imported in src/train.py, so Track A code
     # never touches it at runtime — but installed unconditionally for simplicity.
     "transformers>=4.40.0",
+    # LoRA / PEFT for parameter-efficient fine-tuning of V-JEPA 2 (and other
+    # Track B backbones). Lazy-imported in models/b_vjepa2.py, only when
+    # `model.use_lora=true` — Track A users pay zero cost.
+    "peft>=0.10.0",
 ]
 
 [tool.uv]

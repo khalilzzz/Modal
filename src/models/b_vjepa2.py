@@ -37,11 +37,23 @@ from __future__ import annotations
 
 import inspect
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# Default LoRA target modules for V-JEPA 2 attention. Covers both the
+# llama-style naming (``q_proj`` / ``k_proj`` / ``v_proj`` / ``o_proj``) and
+# the bert-style naming (``query`` / ``key`` / ``value``) so the wrapper
+# works regardless of which transformers release implemented the V-JEPA 2
+# port. peft matches by suffix and silently skips names that don't exist,
+# so listing both forms is safe.
+_DEFAULT_LORA_TARGET_MODULES: tuple[str, ...] = (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "query", "key", "value",
+)
 
 
 class VJEPA2Classifier(nn.Module):
@@ -54,6 +66,17 @@ class VJEPA2Classifier(nn.Module):
         image_size: int = 256,
         freeze_backbone: bool = False,
         use_gradient_checkpointing: bool = False,
+        # ----- LoRA (parameter-efficient fine-tuning) ---------------------- #
+        # When ``use_lora=true``, the backbone is frozen and small low-rank
+        # adapter matrices are inserted in the attention projections. The
+        # classifier head stays fully trainable (via peft's modules_to_save).
+        # Defaults are off so existing checkpoints / commands are unaffected.
+        use_lora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[Sequence[str]] = None,
+        lora_bias: str = "none",
     ) -> None:
         super().__init__()
 
@@ -104,7 +127,27 @@ class VJEPA2Classifier(nn.Module):
             "pixel_values_videos" if "pixel_values_videos" in params else "pixel_values"
         )
 
-        if freeze_backbone:
+        if use_lora and freeze_backbone:
+            # Both flags are about parameter efficiency; LoRA already freezes
+            # everything except its adapters + the head, so the freeze_backbone
+            # toggle is redundant in that case. Warn rather than silently pick.
+            print(
+                "WARNING: both `use_lora=true` and `freeze_backbone=true` are set. "
+                "LoRA already freezes the backbone — ignoring `freeze_backbone`.",
+                flush=True,
+            )
+
+        if use_lora:
+            self._apply_lora(
+                lora_r=int(lora_r),
+                lora_alpha=int(lora_alpha),
+                lora_dropout=float(lora_dropout),
+                target_modules=list(lora_target_modules)
+                if lora_target_modules is not None
+                else list(_DEFAULT_LORA_TARGET_MODULES),
+                bias=str(lora_bias),
+            )
+        elif freeze_backbone:
             for name, param in self.model.named_parameters():
                 if not name.startswith("classifier"):
                     param.requires_grad = False
@@ -124,8 +167,53 @@ class VJEPA2Classifier(nn.Module):
             except AttributeError:
                 pass
 
+    def _apply_lora(
+        self,
+        lora_r: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        target_modules: List[str],
+        bias: str,
+    ) -> None:
+        """Wrap ``self.model`` with a peft LoraConfig.
+
+        Backbone params are frozen by peft, low-rank A/B adapters are inserted
+        on each module whose name suffix matches ``target_modules``, and the
+        ``classifier`` is kept fully trainable via ``modules_to_save`` (peft
+        also handles its serialization/deserialization).
+        """
+        try:
+            from peft import LoraConfig, TaskType, get_peft_model
+        except ImportError as e:
+            raise ImportError(
+                "use_lora=true requires the `peft` package. Run `uv sync` to "
+                "install it (it is declared in pyproject.toml)."
+            ) from e
+
+        lora_cfg = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias=bias,
+            target_modules=target_modules,
+            task_type=TaskType.FEATURE_EXTRACTION,
+            # The classifier head must stay fully trainable (not LoRA-wrapped)
+            # because we're remapping 174 SSv2 logits -> 33 challenge logits.
+            modules_to_save=["classifier"],
+        )
+        self.model = get_peft_model(self.model, lora_cfg)
+
+        # Sanity print so the user can confirm LoRA actually attached.
+        try:
+            self.model.print_trainable_parameters()
+        except AttributeError:
+            pass
+
     def _count_encoder_layers(self) -> int:
-        """Count transformer blocks by inspecting parameter names."""
+        """Count transformer blocks by inspecting parameter names.
+
+        Robust to peft's ``base_model.model.…`` prefix when LoRA is active.
+        """
         layer_nums = set()
         for name, _ in self.model.named_parameters():
             m = re.search(r"\.layer\.(\d+)\.", name) or re.search(

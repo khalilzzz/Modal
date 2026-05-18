@@ -149,40 +149,42 @@ def build_model(cfg: DictConfig) -> nn.Module:
             num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
             freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
         )
-    if name == "b_vjepa2":
+    if name in ("b_vjepa2", "b_vjepa2_1b"):
+        # ViT-L (b_vjepa2) and ViT-g 1B (b_vjepa2_1b) share the same wrapper.
+        # Only the defaults differ — model_id, image_size, gradient checkpointing.
         from models.b_vjepa2 import VJEPA2Classifier
 
-        return VJEPA2Classifier(
-            num_classes=num_classes,
-            pretrained=pretrained,
-            model_id=str(
-                cfg.model.get("model_id", "facebook/vjepa2-vitl-fpc16-256-ssv2")
-            ),
-            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
-            image_size=int(cfg.model.get("image_size", 256)),
-            freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
-            use_gradient_checkpointing=bool(
-                cfg.model.get("use_gradient_checkpointing", False)
-            ),
+        is_1b = name == "b_vjepa2_1b"
+        default_model_id = (
+            "facebook/vjepa2-vitg-fpc64-384-ssv2"
+            if is_1b
+            else "facebook/vjepa2-vitl-fpc16-256-ssv2"
         )
-    if name == "b_vjepa2_1b":
-        # ViT-g (1B) variant. Same wrapper, heavier defaults: 64-frame /
-        # 384×384 native inputs, gradient checkpointing on by default to keep
-        # VRAM survivable on a 24 GB GPU.
-        from models.b_vjepa2 import VJEPA2Classifier
+        default_image_size = 384 if is_1b else 256
+        default_grad_ckpt = is_1b  # mandatory on ViT-g, optional on ViT-L
+
+        # LoRA params are optional. If `model.use_lora` is absent or false,
+        # the wrapper behaves exactly as before — old checkpoints stay loadable.
+        lora_target = cfg.model.get("lora_target_modules", None)
+        if lora_target is not None:
+            lora_target = list(lora_target)  # OmegaConf ListConfig -> list
 
         return VJEPA2Classifier(
             num_classes=num_classes,
             pretrained=pretrained,
-            model_id=str(
-                cfg.model.get("model_id", "facebook/vjepa2-vitg-fpc64-384-ssv2")
-            ),
+            model_id=str(cfg.model.get("model_id", default_model_id)),
             num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
-            image_size=int(cfg.model.get("image_size", 384)),
+            image_size=int(cfg.model.get("image_size", default_image_size)),
             freeze_backbone=bool(cfg.model.get("freeze_backbone", False)),
             use_gradient_checkpointing=bool(
-                cfg.model.get("use_gradient_checkpointing", True)
+                cfg.model.get("use_gradient_checkpointing", default_grad_ckpt)
             ),
+            use_lora=bool(cfg.model.get("use_lora", False)),
+            lora_r=int(cfg.model.get("lora_r", 16)),
+            lora_alpha=int(cfg.model.get("lora_alpha", 32)),
+            lora_dropout=float(cfg.model.get("lora_dropout", 0.05)),
+            lora_target_modules=lora_target,
+            lora_bias=str(cfg.model.get("lora_bias", "none")),
         )
 
     if name == "b_mvitv2":
