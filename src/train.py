@@ -54,7 +54,16 @@ def build_model(cfg: DictConfig) -> nn.Module:
     pretrained = cfg.model.pretrained
 
     if name == "cnn_baseline":
-        return CNNBaseline(num_classes=num_classes, pretrained=pretrained)
+        # Defaults preserve old `.pt` loading: a checkpoint saved before the
+        # multi-backbone refactor has no `backbone` / `dropout` keys in its
+        # cfg, so .get(...) falls back to "resnet18" / 0.0 — matching the
+        # original architecture exactly.
+        return CNNBaseline(
+            num_classes=num_classes,
+            pretrained=pretrained,
+            backbone=str(cfg.model.get("backbone", "resnet18")),
+            dropout=float(cfg.model.get("dropout", 0.0)),
+        )
     if name == "cnn_lstm":
         return CNNLSTM(
             num_classes=num_classes,
