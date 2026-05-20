@@ -1,6 +1,5 @@
 """
-CNN + Bidirectional LSTM with attention pooling — Track A (closed-world) friendly.
-
+CNN + Bidirectional LSTM with attention pooling 
 Forward:
     (B, T, C, H, W)
       ─► ResNet18 per frame ─► (B*T, 512)
